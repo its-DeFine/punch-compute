@@ -1,0 +1,7 @@
+FROM python@sha256:a0c2acf33d1ad5355112e8ae578908f867a76f70f487b4632792d96889d78b7a
+RUN pip install --no-cache-dir gguf==0.19.0 huggingface-hub==1.7.1
+ENV HF_HUB_DISABLE_XET=1 PYTHONDONTWRITEBYTECODE=1
+COPY --chmod=0555 order-gateway.py maintenance.py model_orders.py model_registry.py model_runtime.py newapi_models.py seller_model.py /app/
+USER 1000:1000
+WORKDIR /app
+CMD ["python3", "-u", "/app/order-gateway.py"]

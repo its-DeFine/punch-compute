@@ -1,0 +1,155 @@
+# Immutable seller application images; persistent credentials/mappings and ledger stay outside images.
+name: punch-token-orders
+
+services:
+  livepeer:
+    profiles: [livepeer]
+    image: sha256:870be6a4ade75a55483cbc9671653acdb35c1d28e5b49627a32fda07ef566dde
+    pull_policy: never
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 128
+    working_dir: /data
+    ports: ["127.0.0.1:${LIVEPEER_PORT:-18087}:8935"]
+    volumes:
+      - ./native:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=1000,gid=1000
+    networks: [front]
+    command: ["-config", "/data/node.conf"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7935/status',timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 6
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "2"}
+
+  model:
+    image: ghcr.io/ggml-org/llama.cpp@sha256:83993a631f859a60c2dd8ac7d0c8094752c67cd36dff58ce4b1fa5eedfdea8e5
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    devices: ["nvidia.com/gpu=all"]
+    cpus: 4
+    mem_limit: 10g
+    pids_limit: 256
+    restart: unless-stopped
+    environment:
+      LD_LIBRARY_PATH: /app:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+    volumes:
+      - ${MODEL_GGUF_PATH:?Set MODEL_GGUF_PATH to the verified model file}:/model.gguf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,uid=1000,gid=1000
+    networks: [inference]
+    command: ["--model", "/model.gguf", "--alias", "punch-test-model", "--host", "0.0.0.0", "--port", "8080", "--ctx-size", "4096", "--parallel", "1", "--n-gpu-layers", "99", "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--threads", "4", "--threads-batch", "4", "--jinja", "--reasoning-effort", "low", "--n-predict", "256", "--no-slots", "--metrics"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 90s
+      retries: 6
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "2"}
+
+  new-api:
+    image: sha256:7a50606673b08d9b1518a2f6b485c56effcc17f6c0a2b1a5e89264ceb7691c2c
+    pull_policy: never
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 128
+    working_dir: /data
+    ports: ["127.0.0.1:${GATEWAY_PORT:-18085}:3000"]
+    environment:
+      PUNCH_STRICT_TEXT_MODEL: punch-test-model
+      PUNCH_STRICT_TEXT_RECOVER_ON_START: "true"
+      PUNCH_STRICT_TEXT_BASE_URL: http://model:8080
+      TZ: UTC
+      SQL_DSN: ""
+      SQLITE_PATH: /data/new-api.db
+      REDIS_CONN_STRING: ""
+      BATCH_UPDATE_ENABLED: "false"
+      ERROR_LOG_ENABLED: "true"
+      TRUSTED_PROXIES: none
+    volumes:
+      - ./newapi-data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=1000,gid=1000
+    networks: [front, inference]
+    depends_on:
+      model:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "2"}
+
+  order-api:
+    image: sha256:2acfe4522bd28bc9b5ac207a66a631d3956ae82b0f7cbb5e8a78156af021ed2d
+    pull_policy: never
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    cpus: 1
+    mem_limit: 256m
+    pids_limit: 64
+    working_dir: /app
+    ports: ["127.0.0.1:${ORDER_PORT:-18086}:18086"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      GW_BIND: 0.0.0.0
+      GW_PORT: "18086"
+      GW_ADMIN_BASE: http://new-api:3000
+      GW_PUBLIC_API_BASE: http://127.0.0.1:${GATEWAY_PORT:-18085}
+      GW_LIVEPEER_CHECKOUT: ${GW_LIVEPEER_CHECKOUT:-false}
+      GW_NATIVE_NODE_BASE: ${GW_NATIVE_NODE_BASE:-}
+      GW_NATIVE_REGISTRATION_FILE: ${GW_NATIVE_REGISTRATION_FILE:-}
+      GW_NATIVE_RUNNER_URL: ${GW_NATIVE_RUNNER_URL:-}
+      GW_PUBLIC_ORDER_BASE: http://127.0.0.1:${ORDER_PORT:-18086}
+      GW_DATA_DIR: /data
+      GW_ADMIN_USER_FILE: /run/punch/admin_user
+      GW_ADMIN_PASS_FILE: /run/punch/admin_pass
+      GW_SELLER_TOKEN_FILE: /run/punch/seller.token
+    volumes:
+      - ./app:/run/punch:ro
+      - ./app/data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=1000,gid=1000
+    networks: [front]
+    command: [python3, -u, /app/order-gateway.py]
+    depends_on:
+      new-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18086/health',timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "2"}
+
+networks:
+  front: {}
+  inference:
+    internal: true

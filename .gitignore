@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+.packaging-test-image
+packaging/app/
+packaging/newapi-data/
+packaging/native/
+packaging/models/
+packaging/images.tar.gz
+packaging/images.sha256

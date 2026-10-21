@@ -1,0 +1,3789 @@
+diff --git a/controller/misc.go b/controller/misc.go
+index abebc1ef3..07f7f2795 100644
+--- a/controller/misc.go
++++ b/controller/misc.go
+@@ -52,6 +52,7 @@ func GetStatus(c *gin.Context) {
+ 
+ 	data := gin.H{
+ 		"version":                     common.Version,
++		"punch_strict_text_policy":    1,
+ 		"start_time":                  common.StartTime,
+ 		"email_verification":          common.EmailVerificationEnabled,
+ 		"github_oauth":                common.GitHubOAuthEnabled,
+diff --git a/controller/relay.go b/controller/relay.go
+index 1c42437e3..5f67d25cd 100644
+--- a/controller/relay.go
++++ b/controller/relay.go
+@@ -141,6 +141,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
+ 		return
+ 	}
++	// Release a strict-order admission after billing cleanup: registered
++	// before the refund defer so LIFO order settles or refunds first. It is
++	// a no-op for requests without an admission.
++	defer relay.ReleaseStrictOrderAdmission(c)
+ 	defer func() {
+ 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
+ 	}()
+@@ -201,6 +205,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+ 			return
+ 		}
+ 
++		if relayInfo.StrictTextBilling {
++			break
++		} // Never replay uncertain strict inference.
+ 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
+ 		relayInfo.LastError = newAPIError
+ 
+diff --git a/controller/token.go b/controller/token.go
+index 7c6e6a6ad..cfc8acb4e 100644
+--- a/controller/token.go
++++ b/controller/token.go
+@@ -1,10 +1,12 @@
+ package controller
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/QuantumNous/new-api/common"
+ 	"github.com/QuantumNous/new-api/constant"
+@@ -34,12 +36,15 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
+ 
+ type tokenRequest struct {
+ 	model.Token
+-	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
++	AutoGroups    tokenAutoGroupsInput `json:"auto_groups"`
++	ExpectedModel string               `json:"expected_model"`
++	Model         string               `json:"model"`
+ }
+ 
+ type tokenResponse struct {
+ 	*model.Token
+-	AutoGroups []string `json:"auto_groups"`
++	AutoGroups         []string                        `json:"auto_groups"`
++	StrictReservations *model.StrictReservationSummary `json:"strict_reservations,omitempty"`
+ }
+ 
+ func maxTokenQuota() int {
+@@ -170,7 +175,15 @@ func GetToken(c *gin.Context) {
+ 		common.ApiError(c, err)
+ 		return
+ 	}
+-	common.ApiSuccess(c, buildMaskedTokenResponse(token))
++	response := buildMaskedTokenResponse(token)
++	if token.StrictTextPolicy != nil {
++		response.StrictReservations, err = model.StrictTextReservationSummary(token.Id)
++		if err != nil {
++			common.ApiError(c, err)
++			return
++		}
++	}
++	common.ApiSuccess(c, response)
+ }
+ 
+ func GetTokenAutoGroups(c *gin.Context) {
+@@ -344,6 +357,15 @@ func AddToken(c *gin.Context) {
+ 		Group:              token.Group,
+ 		CrossGroupRetry:    token.CrossGroupRetry,
+ 		AutoGroups:         token.AutoGroups,
++		StrictTextPolicy:   token.StrictTextPolicy,
++	}
++	// Policy tokens require finite quota, enforced model limits and exactly
++	// one model at creation; wallet-only settlement is enforced relay-side.
++	if cleanToken.StrictTextPolicy != nil {
++		if err := cleanToken.ValidateStrictTextPolicy(); err != nil {
++			common.ApiError(c, err)
++			return
++		}
+ 	}
+ 	err = cleanToken.Insert()
+ 	if err != nil {
+@@ -380,6 +402,76 @@ func DeleteToken(c *gin.Context) {
+ 	})
+ }
+ 
++// updateTokenStrictModel serves PUT /api/token/?model_only=true. Body carries
++// id, expected_model and model. It compare-and-swaps the exact current single
++// model after ownership and policy checks, updating model_limits alone.
++func updateTokenStrictModel(c *gin.Context, userId int, request tokenRequest) {
++	if request.Token.Id == 0 {
++		common.ApiError(c, fmt.Errorf("strict policy model update requires token id"))
++		return
++	}
++	cleanToken, unlock, err := model.GetTokenForStrictOperation(request.Token.Id, userId)
++	defer unlock()
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	if err := cleanToken.ValidateStrictTextPolicy(); err != nil {
++		common.ApiError(c, fmt.Errorf("strict policy model update unavailable"))
++		return
++	}
++	current, ok := model.StrictPolicySingleModel(cleanToken.ModelLimits)
++	if !cleanToken.ModelLimitsEnabled || !ok || current != request.ExpectedModel {
++		common.ApiError(c, fmt.Errorf("strict policy current model mismatch"))
++		return
++	}
++	next, ok := model.StrictPolicySingleModel(request.Model)
++	if !ok {
++		common.ApiError(c, fmt.Errorf("strict policy model invalid"))
++		return
++	}
++	// Replacement waits for a drained order: the token must already be
++	// disabled and no strict request may still be admitted. The swap itself
++	// still touches model_limits alone, never key, quota or policy.
++	orderRef := model.StrictOrderRef{ID: cleanToken.Id, Key: cleanToken.Key}
++	if cleanToken.Status != common.TokenStatusDisabled {
++		common.ApiError(c, fmt.Errorf("strict policy model update requires disabled token"))
++		return
++	}
++	summary, reservationErr := model.StrictTextReservationSummary(cleanToken.Id)
++	if reservationErr != nil {
++		common.ApiError(c, reservationErr)
++		return
++	}
++	if summary.ReservedCount+summary.DispatchedCount > 0 {
++		common.ApiError(c, fmt.Errorf("strict order has unresolved reservations"))
++		return
++	}
++	if model.StrictTokenAdmittedCount(orderRef) > 0 {
++		common.ApiError(c, fmt.Errorf("strict policy model update waits for admitted requests to finish"))
++		return
++	}
++	swapped, err := model.CASStrictTextModel(cleanToken.Id, userId, cleanToken.Key, current, next)
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	if !swapped {
++		common.ApiError(c, fmt.Errorf("strict policy model changed concurrently"))
++		return
++	}
++	cleanToken.ModelLimits = next
++	params := tokenAuditParams(c)
++	params["id"] = cleanToken.Id
++	params["changed_fields"] = []string{"model_limits"}
++	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
++	c.JSON(http.StatusOK, gin.H{
++		"success": true,
++		"message": "",
++		"data":    buildMaskedTokenResponse(cleanToken),
++	})
++}
++
+ func UpdateToken(c *gin.Context) {
+ 	userId := c.GetInt("id")
+ 	statusOnly := c.Query("status_only")
+@@ -389,6 +481,14 @@ func UpdateToken(c *gin.Context) {
+ 		common.ApiError(c, err)
+ 		return
+ 	}
++	// Model-only policy binding runs before ordinary quota validation and
++	// update: compare-and-swap the exact current single model, touching
++	// model_limits alone and never quota/used/expiry/name/policy/key.
++	// Ownership comes from the existing route lookup.
++	if c.Query("model_only") != "" {
++		updateTokenStrictModel(c, userId, request)
++		return
++	}
+ 	token := request.Token
+ 	params := tokenAuditParams(c)
+ 	if token.Id > 0 {
+@@ -409,13 +509,27 @@ func UpdateToken(c *gin.Context) {
+ 			return
+ 		}
+ 	}
+-	cleanToken, err := model.GetTokenByIds(token.Id, userId)
++	cleanToken, unlock, err := model.GetTokenForStrictOperation(token.Id, userId)
++	defer unlock()
+ 	if err != nil {
+ 		common.ApiError(c, err)
+ 		return
+ 	}
+ 	params["name"] = cleanToken.Name
+ 	previous := *cleanToken
++	// Policy tokens refuse general edits: rates are immutable after creation
++	// and ModelLimits/unlimited/group changes must use the model-only path.
++	// Malformed stored policy also refuses since binding cannot be verified.
++	if previous.StrictTextPolicy != nil {
++		if err := previous.ValidateStrictTextPolicy(); err != nil {
++			common.ApiError(c, err)
++			return
++		}
++		if statusOnly == "" {
++			common.ApiError(c, fmt.Errorf("policy tokens accept only model-only or status-only updates"))
++			return
++		}
++	}
+ 	if token.Status == common.TokenStatusEnabled {
+ 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
+ 			common.ApiErrorI18n(c, i18n.MsgTokenExpiredCannotEnable)
+@@ -448,11 +562,46 @@ func UpdateToken(c *gin.Context) {
+ 			}
+ 		}
+ 	}
+-	err = cleanToken.Update()
++	if previous.StrictTextPolicy != nil {
++		// Quota-safe narrow status update: status and access time only,
++		// never quota, usage, expiry, limits, or policy.
++		err = cleanToken.SelectUpdate()
++	} else {
++		err = cleanToken.Update()
++	}
+ 	if err != nil {
+ 		common.ApiError(c, err)
+ 		return
+ 	}
++	if previous.StrictTextPolicy != nil {
++		orderRef := model.StrictOrderRef{ID: cleanToken.Id, Key: cleanToken.Key}
++		if cleanToken.Status == common.TokenStatusEnabled {
++			model.StrictTokenClearDisable(orderRef)
++		} else {
++			// Disabled status is already persisted above and survives
++			// restarts. Now refuse new admissions and wait for admitted
++			// strict requests to finish including settlement, bounded by
++			// the request context and 30s. A cancelled wait keeps the
++			// disabled status; unfinished financial reservations stay
++			// with their own recovery path.
++			model.StrictTokenBeginDisable(orderRef)
++			drainCtx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
++			drainErr := model.StrictTokenWaitDrained(drainCtx, orderRef)
++			cancel()
++			if drainErr == nil {
++				summary, err := model.StrictTextReservationSummary(cleanToken.Id)
++				if err != nil {
++					drainErr = err
++				} else if summary.ReservedCount+summary.DispatchedCount > 0 {
++					drainErr = fmt.Errorf("strict order has unresolved reservations")
++				}
++			}
++			if drainErr != nil {
++				common.ApiError(c, fmt.Errorf("strict order disabled; drain incomplete: %w", drainErr))
++				return
++			}
++		}
++	}
+ 	params["name"] = cleanToken.Name
+ 	if statusOnly != "" {
+ 		params["from"], params["to"] = previous.Status, cleanToken.Status
+diff --git a/controller/token_test.go b/controller/token_test.go
+index 28af3bb9c..caef7678e 100644
+--- a/controller/token_test.go
++++ b/controller/token_test.go
+@@ -2,6 +2,7 @@ package controller
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"database/sql"
+ 	"encoding/json"
+ 	"errors"
+@@ -105,7 +106,7 @@ func openTokenControllerTestDB(t *testing.T) *gorm.DB {
+ func migrateTokenControllerTestDB(t *testing.T, db *gorm.DB) {
+ 	t.Helper()
+ 
+-	if err := db.AutoMigrate(&model.Token{}); err != nil {
++	if err := db.AutoMigrate(&model.Token{}, &model.StrictTextReservation{}); err != nil {
+ 		t.Fatalf("failed to migrate token table: %v", err)
+ 	}
+ }
+@@ -892,3 +893,343 @@ func verifyAPITokenAudit(t *testing.T) {
+ 		assert.EqualValues(t, 1, count)
+ 	})
+ }
++
++func setupStrictPolicyControllerTest(t *testing.T) *model.User {
++	t.Helper()
++	db := setupTokenControllerTestDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}))
++	user := &model.User{
++		Username: "token-policy-user",
++		Password: "password",
++		Group:    "default",
++		Status:   common.UserStatusEnabled,
++	}
++	require.NoError(t, db.Create(user).Error)
++	return user
++}
++
++func insertStrictPolicyToken(t *testing.T, userID int, modelName string, quota int) *model.Token {
++	t.Helper()
++	token := &model.Token{
++		UserId:             userID,
++		Key:                "strict-policy-" + common.GetRandomString(8),
++		Name:               "strict-policy-order",
++		Status:             common.TokenStatusEnabled,
++		ExpiredTime:        -1,
++		RemainQuota:        quota,
++		ModelLimitsEnabled: true,
++		ModelLimits:        modelName,
++		StrictTextPolicy: &model.StrictTextPolicy{
++			InputRate: 1, OutputRate: 5, CacheRate: 1,
++			ContextTokens: 4096, MaxOutputTokens: 256, ReasoningEffort: "low",
++		},
++	}
++	require.NoError(t, token.Insert())
++	return token
++}
++
++func readStrictPolicyToken(t *testing.T, id int) model.Token {
++	t.Helper()
++	var token model.Token
++	require.NoError(t, model.DB.First(&token, id).Error)
++	return token
++}
++
++func TestUpdateTokenModelOnlyCAS(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	// Replacement requires a drained order: disable first.
++	dctx, drecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}, user.Id)
++	UpdateToken(dctx)
++	require.True(t, decodeAPIResponse(t, drecorder).Success)
++
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(ctx)
++
++	response := decodeAPIResponse(t, recorder)
++	require.True(t, response.Success, response.Message)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, "model-b", stored.ModelLimits)
++	assert.Equal(t, 1000, stored.RemainQuota)
++	assert.Equal(t, 0, stored.UsedQuota)
++	assert.Equal(t, "strict-policy-order", stored.Name)
++	assert.Equal(t, int64(-1), stored.ExpiredTime)
++	assert.Equal(t, token.Key, stored.Key)
++	require.NotNil(t, stored.StrictTextPolicy)
++	assert.Equal(t, float64(1), stored.StrictTextPolicy.InputRate)
++	assert.Equal(t, float64(5), stored.StrictTextPolicy.OutputRate)
++}
++
++func TestUpdateTokenModelOnlyRejects(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	for _, tc := range []struct {
++		name string
++		body map[string]any
++	}{
++		{"wrong expected", map[string]any{"id": token.Id, "expected_model": "model-x", "model": "model-b"}},
++		{"bad new model", map[string]any{"id": token.Id, "expected_model": "model-a", "model": "a,b"}},
++		{"missing id", map[string]any{"expected_model": "model-a", "model": "model-b"}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true", tc.body, user.Id)
++			UpdateToken(ctx)
++			response := decodeAPIResponse(t, recorder)
++			require.False(t, response.Success)
++		})
++	}
++
++	legacy := &model.Token{UserId: user.Id, Key: "legacy-" + common.GetRandomString(8),
++		Name: "legacy", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100}
++	require.NoError(t, legacy.Insert())
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": legacy.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, "model-a", stored.ModelLimits)
++	assert.Equal(t, 1000, stored.RemainQuota)
++}
++
++func TestUpdateTokenModelOnlyMalformedPolicy(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++	require.NoError(t, model.DB.Exec("UPDATE tokens SET strict_text_policy = '{' WHERE id = ?", token.Id).Error)
++
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++	var storedModel string
++	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Pluck("model_limits", &storedModel).Error)
++	assert.Equal(t, "model-a", storedModel)
++}
++
++func TestUpdateTokenGeneralPUTRefusedForPolicy(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/",
++		map[string]any{"id": token.Id, "name": "renamed", "remain_quota": 1000,
++			"expired_time": -1, "model_limits_enabled": true, "model_limits": "model-a"}, user.Id)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, "strict-policy-order", stored.Name)
++	assert.Equal(t, 1000, stored.RemainQuota)
++}
++
++func TestUpdateTokenStatusOnlyNarrowForPolicy(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	// Tampered quota in the body must not reach the row: status-only writes
++	// status and access time alone.
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": token.Id, "status": common.TokenStatusDisabled, "remain_quota": 9999}, user.Id)
++	UpdateToken(ctx)
++	require.True(t, decodeAPIResponse(t, recorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, common.TokenStatusDisabled, stored.Status)
++	assert.Equal(t, 1000, stored.RemainQuota)
++	assert.Equal(t, 0, stored.UsedQuota)
++	assert.Equal(t, "model-a", stored.ModelLimits)
++}
++
++func TestUpdateTokenModelOnlyRequiresDisabledToken(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	// Enabled token with correct expected model: must still be denied.
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, "model-a", stored.ModelLimits)
++	assert.Equal(t, token.Key, stored.Key)
++	assert.Equal(t, 1000, stored.RemainQuota)
++	require.NotNil(t, stored.StrictTextPolicy)
++
++	// After status-only disable with zero admitted requests, the same update succeeds.
++	dctx, drecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}, user.Id)
++	UpdateToken(dctx)
++	require.True(t, decodeAPIResponse(t, drecorder).Success)
++
++	mctx, mrecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(mctx)
++	require.True(t, decodeAPIResponse(t, mrecorder).Success)
++	assert.Equal(t, "model-b", readStrictPolicyToken(t, token.Id).ModelLimits)
++}
++
++func TestUpdateTokenModelOnlyDeniedWhileAdmitted(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	// Admit one request while enabled, as an in-flight relay request would.
++	ref := model.StrictOrderRef{ID: token.Id, Key: token.Key}
++	require.True(t, model.StrictTokenAdmit(ref))
++
++	// Disabling with the admission held cannot finish the drain: the
++	// response reports it, but the persisted status is already disabled.
++	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
++	defer timeoutCancel()
++	dctx, drecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}, user.Id)
++	dctx.Request = dctx.Request.WithContext(timeoutCtx)
++	UpdateToken(dctx)
++	require.False(t, decodeAPIResponse(t, drecorder).Success)
++	assert.Equal(t, common.TokenStatusDisabled, readStrictPolicyToken(t, token.Id).Status)
++
++	// A held admission blocks the replacement without touching the row.
++	mctx, mrecorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(mctx)
++	require.False(t, decodeAPIResponse(t, mrecorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, "model-a", stored.ModelLimits)
++	assert.Equal(t, token.Key, stored.Key)
++	assert.Equal(t, 1000, stored.RemainQuota)
++	require.NotNil(t, stored.StrictTextPolicy)
++
++	// Completion releases the order: the same update now succeeds.
++	model.StrictTokenRelease(ref)
++	mctx2, mrecorder2 := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": token.Id, "expected_model": "model-a", "model": "model-b"}, user.Id)
++	UpdateToken(mctx2)
++	require.True(t, decodeAPIResponse(t, mrecorder2).Success)
++	assert.Equal(t, "model-b", readStrictPolicyToken(t, token.Id).ModelLimits)
++}
++
++func TestUpdateTokenStatusOnlyCancelledDrainStaysDisabled(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++
++	// Hold one admission and cancel the request context: the disable
++	// reports the unfinished drain but the persisted status stays disabled.
++	ref := model.StrictOrderRef{ID: token.Id, Key: token.Key}
++	require.True(t, model.StrictTokenAdmit(ref))
++	defer model.StrictTokenRelease(ref)
++
++	cancelCtx, cancel := context.WithCancel(context.Background())
++	cancel()
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": token.Id, "status": common.TokenStatusDisabled}, user.Id)
++	ctx.Request = ctx.Request.WithContext(cancelCtx)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++
++	stored := readStrictPolicyToken(t, token.Id)
++	assert.Equal(t, common.TokenStatusDisabled, stored.Status)
++	assert.Equal(t, 1000, stored.RemainQuota)
++	assert.Equal(t, 0, stored.UsedQuota)
++	assert.Equal(t, "model-a", stored.ModelLimits)
++}
++
++func TestStrictTextPolicyAddAndForeignOwner(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	policy := &model.StrictTextPolicy{InputRate: 2, OutputRate: 3, CacheRate: 1, ContextTokens: 64, MaxOutputTokens: 8}
++	body := map[string]any{"name": "purchased-policy", "remain_quota": 100, "expired_time": -1,
++		"model_limits_enabled": true, "model_limits": "model-a", "strict_text_policy": policy}
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, user.Id)
++	AddToken(ctx)
++	response := decodeAPIResponse(t, recorder)
++	require.True(t, response.Success, response.Message)
++	var stored model.Token
++	require.NoError(t, model.DB.Where("user_id = ?", user.Id).First(&stored).Error)
++	require.Equal(t, policy, stored.StrictTextPolicy)
++	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": stored.Id, "expected_model": "model-a", "model": "model-b", "remain_quota": 9999}, user.Id+1)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++	require.Equal(t, "model-a", readStrictPolicyToken(t, stored.Id).ModelLimits)
++	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
++		map[string]any{"id": stored.Id, "status": common.TokenStatusDisabled}, user.Id)
++	UpdateToken(ctx)
++	require.True(t, decodeAPIResponse(t, recorder).Success)
++	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true",
++		map[string]any{"id": stored.Id, "expected_model": "model-a", "model": "model-b", "remain_quota": 9999}, user.Id)
++	UpdateToken(ctx)
++	require.True(t, decodeAPIResponse(t, recorder).Success)
++	after := readStrictPolicyToken(t, stored.Id)
++	require.Equal(t, 100, after.RemainQuota)
++	require.Equal(t, policy, after.StrictTextPolicy)
++	require.Equal(t, stored.Key, after.Key)
++}
++
++func TestStrictReservationRestartHoldBlocksModelChange(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", 1000).Error)
++	oldRedis, oldBatch := common.RedisEnabled, common.BatchUpdateEnabled
++	common.RedisEnabled, common.BatchUpdateEnabled = false, false
++	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldBatch })
++	_, err := model.ReserveStrictTextWalletReservation(model.StrictReservationInput{
++		RequestId: "controller-held", UserId: user.Id, TokenId: token.Id, TokenKey: token.Key,
++		Model: "model-a", Policy: *token.StrictTextPolicy, ReservedQuota: 100,
++	})
++	require.NoError(t, err)
++	_, err = model.MarkStrictTextReservationDispatched("controller-held")
++	require.NoError(t, err)
++	// Durable restart checkpoint: token disabled; no in-memory admissions exist.
++	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusDisabled).Error)
++	require.Zero(t, model.StrictTokenAdmittedCount(model.StrictOrderRef{ID: token.Id, Key: token.Key}))
++	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?model_only=true", map[string]any{
++		"id": token.Id, "expected_model": "model-a", "model": "model-b",
++	}, user.Id)
++	UpdateToken(ctx)
++	require.False(t, decodeAPIResponse(t, recorder).Success)
++	require.Equal(t, "model-a", readStrictPolicyToken(t, token.Id).ModelLimits)
++	require.Equal(t, 900, readStrictPolicyToken(t, token.Id).RemainQuota)
++}
++
++func TestGetTokenDurableUsageSurvivesMissingConsumeLog(t *testing.T) {
++	user := setupStrictPolicyControllerTest(t)
++	require.NoError(t, model.DB.Model(user).Update("quota", 1000).Error)
++	token := insertStrictPolicyToken(t, user.Id, "model-a", 1000)
++	_, err := model.ReserveStrictTextWalletReservation(model.StrictReservationInput{
++		RequestId: "recovered-usage", UserId: user.Id, TokenId: token.Id, TokenKey: token.Key,
++		Model: "model-a", Policy: *token.StrictTextPolicy, ReservedQuota: 100,
++	})
++	require.NoError(t, err)
++	_, err = model.MarkStrictTextReservationDispatched("recovered-usage")
++	require.NoError(t, err)
++	_, err = model.RecordStrictTextResult("recovered-usage", 9, 1, 14)
++	require.NoError(t, err)
++	_, err = model.RecoverRecordedStrictTextResult("recovered-usage")
++	require.NoError(t, err)
++	// No consume log is written: the actual token readback must use its
++	// canonical native records, not a best-effort or truncated log query.
++	require.NoError(t, model.DB.Create(&model.StrictTextReservation{RequestId: "foreign", TokenId: token.Id + 1, State: model.StrictReservationSettled, ResultRecorded: true, ActualPromptTokens: 900, ActualCompletionTokens: 100, ActualQuota: 1400}).Error)
++	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/"+strconv.Itoa(token.Id), nil, user.Id)
++	ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
++	GetToken(ctx)
++	response := decodeAPIResponse(t, recorder)
++	require.True(t, response.Success, response.Message)
++	var data map[string]any
++	require.NoError(t, common.Unmarshal(response.Data, &data))
++	summary, ok := data["strict_reservations"].(map[string]any)
++	require.True(t, ok)
++	assert.Equal(t, float64(1), summary["settled_count"])
++	assert.Equal(t, float64(14), summary["settled_quota"])
++	assert.Equal(t, float64(9), summary["input_tokens"])
++	assert.Equal(t, float64(1), summary["output_tokens"])
++	assert.Equal(t, float64(0), summary["unrecorded_settled_count"])
++	assert.NotContains(t, recorder.Body.String(), token.Key)
++	denied, deniedRecorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/"+strconv.Itoa(token.Id), nil, user.Id+1)
++	denied.Params = ctx.Params
++	GetToken(denied)
++	assert.False(t, decodeAPIResponse(t, deniedRecorder).Success)
++}
+diff --git a/model/main.go b/model/main.go
+index 917d4e051..7b047819d 100644
+--- a/model/main.go
++++ b/model/main.go
+@@ -220,6 +220,24 @@ func InitDB() (err error) {
+ 		}
+ 		common.SysLog("database migration started")
+ 		err = migrateDB()
++		if err == nil && os.Getenv("PUNCH_STRICT_TEXT_RECOVER_ON_START") == "true" {
++			err = RecoverUndispatchedStrictTextReservations()
++			// Resume only definitive results retained by this native ledger.
++			// Unknown dispatched requests remain held, irrespective of log state.
++			for err == nil {
++				var recorded []StrictTextReservation
++				err = DB.Where("state = ? AND result_recorded = ?", StrictReservationDispatched, true).
++					Order("id").Limit(100).Find(&recorded).Error
++				if err != nil || len(recorded) == 0 {
++					break
++				}
++				for _, reservation := range recorded {
++					if _, err = RecoverRecordedStrictTextResult(reservation.RequestId); err != nil {
++						break
++					}
++				}
++			}
++		}
+ 		return err
+ 	} else {
+ 		common.FatalLog(err)
+@@ -337,6 +355,7 @@ func migrateDB() error {
+ 	err := DB.AutoMigrate(
+ 		&Channel{},
+ 		&Token{},
++		&StrictTextReservation{},
+ 		&User{},
+ 		&UserSession{},
+ 		&AuthFlow{},
+diff --git a/model/strict_text_policy.go b/model/strict_text_policy.go
+new file mode 100644
+index 000000000..eae827320
+--- /dev/null
++++ b/model/strict_text_policy.go
+@@ -0,0 +1,79 @@
++package model
++
++import (
++	"database/sql/driver"
++	"fmt"
++	"math"
++	"strings"
++	"unicode"
++
++	"github.com/QuantumNous/new-api/common"
++)
++
++// StrictTextPolicy is the immutable per-order strict-text billing policy
++// persisted with a Token. Relay binds the request model and captured rates
++// from it; see relay/request_billing.go.
++type StrictTextPolicy struct {
++	InputRate       float64 `json:"input_rate"`
++	OutputRate      float64 `json:"output_rate"`
++	CacheRate       float64 `json:"cache_rate"`
++	ContextTokens   int     `json:"context_tokens"`
++	MaxOutputTokens int     `json:"max_output_tokens"`
++	ReasoningEffort string  `json:"reasoning_effort,omitempty"`
++}
++
++// Value implements driver.Valuer, storing the policy as JSON text. String
++// (never []byte) keeps Postgres simple-protocol writes off bytea.
++func (p *StrictTextPolicy) Value() (driver.Value, error) {
++	if p == nil {
++		return nil, nil
++	}
++	data, err := common.Marshal(p)
++	if err != nil {
++		return nil, err
++	}
++	return string(data), nil
++}
++
++// Scan implements sql.Scanner, accepting the text/bytes forms drivers return.
++// A NULL column leaves the target untouched so legacy rows stay policy-less.
++func (p *StrictTextPolicy) Scan(value any) error {
++	raw := jsonScanBytes(value)
++	if raw == nil {
++		return nil
++	}
++	return common.Unmarshal(raw, p)
++}
++
++func (p StrictTextPolicy) Validate() error {
++	for name, rate := range map[string]float64{"input_rate": p.InputRate, "output_rate": p.OutputRate} {
++		if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 {
++			return fmt.Errorf("strict_text_policy.%s must be a finite positive rate", name)
++		}
++	}
++	if math.IsInf(p.OutputRate/p.InputRate, 0) || p.OutputRate/p.InputRate == 0 {
++		return fmt.Errorf("strict_text_policy output/input ratio is outside supported precision")
++	}
++	if math.IsNaN(p.CacheRate) || math.IsInf(p.CacheRate, 0) || p.CacheRate < 0 || p.CacheRate > p.InputRate {
++		return fmt.Errorf("strict_text_policy.cache_rate must be finite, non-negative and <= input_rate")
++	}
++	if p.ContextTokens <= 0 {
++		return fmt.Errorf("strict_text_policy.context_tokens must be a positive integer")
++	}
++	if p.MaxOutputTokens <= 0 || p.MaxOutputTokens > p.ContextTokens {
++		return fmt.Errorf("strict_text_policy.max_output_tokens must be positive and <= context_tokens")
++	}
++	if p.ReasoningEffort != "" && p.ReasoningEffort != "low" {
++		return fmt.Errorf("strict_text_policy.reasoning_effort must be empty or low")
++	}
++	return nil
++}
++
++// StrictPolicySingleModel accepts exactly one nonempty model name.
++func StrictPolicySingleModel(modelLimits string) (string, bool) {
++	name := modelLimits
++	if name == "" || strings.ContainsAny(name, ",*") || strings.IndexFunc(name, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
++		return "", false
++	}
++	return name, true
++}
+diff --git a/model/strict_text_policy_test.go b/model/strict_text_policy_test.go
+new file mode 100644
+index 000000000..510c3bd6c
+--- /dev/null
++++ b/model/strict_text_policy_test.go
+@@ -0,0 +1,184 @@
++package model
++
++import (
++	"math"
++	"sync"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func validTestPolicy() *StrictTextPolicy {
++	return &StrictTextPolicy{
++		InputRate: 1, OutputRate: 5, CacheRate: 1,
++		ContextTokens: 4096, MaxOutputTokens: 256, ReasoningEffort: "low",
++	}
++}
++
++func TestStrictTextPolicyValidate(t *testing.T) {
++	good := *validTestPolicy()
++	for _, tc := range []struct {
++		name   string
++		mutate func(*StrictTextPolicy)
++		valid  bool
++	}{
++		{"valid", func(p *StrictTextPolicy) {}, true},
++		{"zero cache", func(p *StrictTextPolicy) { p.CacheRate = 0 }, true},
++		{"cache equals input", func(p *StrictTextPolicy) { p.CacheRate = p.InputRate }, true},
++		{"empty reasoning", func(p *StrictTextPolicy) { p.ReasoningEffort = "" }, true},
++		{"nan input", func(p *StrictTextPolicy) { p.InputRate = math.NaN() }, false},
++		{"ratio overflow", func(p *StrictTextPolicy) {
++			p.InputRate = math.SmallestNonzeroFloat64
++			p.CacheRate = 0
++			p.OutputRate = math.MaxFloat64
++		}, false},
++		{"inf output", func(p *StrictTextPolicy) { p.OutputRate = math.Inf(1) }, false},
++		{"zero input", func(p *StrictTextPolicy) { p.InputRate = 0 }, false},
++		{"negative output", func(p *StrictTextPolicy) { p.OutputRate = -1 }, false},
++		{"negative cache", func(p *StrictTextPolicy) { p.CacheRate = -1 }, false},
++		{"cache above input", func(p *StrictTextPolicy) { p.CacheRate = 2 }, false},
++		{"zero context", func(p *StrictTextPolicy) { p.ContextTokens = 0 }, false},
++		{"zero max output", func(p *StrictTextPolicy) { p.MaxOutputTokens = 0 }, false},
++		{"max above context", func(p *StrictTextPolicy) { p.MaxOutputTokens = 5000 }, false},
++		{"bad reasoning", func(p *StrictTextPolicy) { p.ReasoningEffort = "high" }, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			policy := good
++			tc.mutate(&policy)
++			if tc.valid {
++				require.NoError(t, policy.Validate())
++			} else {
++				require.Error(t, policy.Validate())
++			}
++		})
++	}
++}
++
++func TestStrictTextPolicySingleModel(t *testing.T) {
++	name, ok := StrictPolicySingleModel("punch-test-model")
++	require.True(t, ok)
++	assert.Equal(t, "punch-test-model", name)
++	for _, bad := range []string{"", "  ", "a,b", "a, b", " model", "a\nb", "a\x00b", "*"} {
++		_, ok := StrictPolicySingleModel(bad)
++		assert.False(t, ok, bad)
++	}
++}
++
++func insertPolicyToken(t *testing.T, userID int, modelName string, quota int, policy *StrictTextPolicy) Token {
++	t.Helper()
++	token := Token{
++		UserId:             userID,
++		Key:                "policy-token-" + common.GetRandomString(8),
++		Name:               "policy-" + modelName,
++		Status:             1,
++		ExpiredTime:        -1,
++		RemainQuota:        quota,
++		ModelLimitsEnabled: true,
++		ModelLimits:        modelName,
++		StrictTextPolicy:   policy,
++	}
++	require.NoError(t, token.Insert())
++	return token
++}
++
++func TestStrictTextPolicyRoundTripAndLegacyNil(t *testing.T) {
++	user := createReserveTestUser(t, 100000)
++	stored := insertPolicyToken(t, user.Id, "model-a", 1000, validTestPolicy())
++	read := getTokenFromDB(t, stored.Id)
++	require.NotNil(t, read.StrictTextPolicy)
++	require.NoError(t, read.ValidateStrictTextPolicy())
++	assert.Equal(t, *validTestPolicy(), *read.StrictTextPolicy)
++
++	legacy := createReserveTestToken(t, 500)
++	legacyRead := getTokenFromDB(t, legacy.Id)
++	assert.Nil(t, legacyRead.StrictTextPolicy)
++	require.Error(t, legacyRead.ValidateStrictTextPolicy())
++}
++
++func TestStrictTextPolicyInsertGuards(t *testing.T) {
++	user := createReserveTestUser(t, 100000)
++	base := Token{UserId: user.Id, Key: "guard-token", Name: "guard", Status: 1,
++		ExpiredTime: -1, RemainQuota: 100, ModelLimitsEnabled: true,
++		ModelLimits: "model-a", StrictTextPolicy: validTestPolicy()}
++	unlimited := base
++	unlimited.Key = "guard-unlimited"
++	unlimited.UnlimitedQuota = true
++	require.Error(t, unlimited.Insert())
++
++	unenforced := base
++	unenforced.Key = "guard-unenforced"
++	unenforced.ModelLimitsEnabled = false
++	require.Error(t, unenforced.Insert())
++
++	multi := base
++	multi.Key = "guard-multi"
++	multi.ModelLimits = "model-a,model-b"
++	require.Error(t, multi.Insert())
++
++	badRate := base
++	badRate.Key = "guard-badrate"
++	badRate.StrictTextPolicy = &StrictTextPolicy{InputRate: -1, OutputRate: 5,
++		CacheRate: 0, ContextTokens: 4096, MaxOutputTokens: 256}
++	require.Error(t, badRate.Insert())
++
++	require.NoError(t, base.Insert())
++}
++
++func TestCASStrictTextModelConcurrentQuota(t *testing.T) {
++	user := createReserveTestUser(t, 100000)
++	token := insertPolicyToken(t, user.Id, "model-a", 1000, validTestPolicy())
++	before := getTokenFromDB(t, token.Id)
++
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++	swap := make(chan bool, 1)
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		<-start
++		changed, err := CASStrictTextModel(token.Id, user.Id, token.Key, "model-a", "model-b")
++		assert.NoError(t, err)
++		swap <- changed
++	}()
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			<-start
++			ok, err := TryReserveTokenQuota(token.Id, token.Key, 10, false)
++			assert.NoError(t, err)
++			assert.True(t, ok)
++		}()
++	}
++	close(start)
++	wg.Wait()
++	require.True(t, <-swap)
++	swappedAgain, err := CASStrictTextModel(token.Id, user.Id, token.Key, "model-a", "model-c")
++	require.NoError(t, err)
++	require.False(t, swappedAgain)
++
++	after := getTokenFromDB(t, token.Id)
++	assert.Equal(t, "model-b", after.ModelLimits)
++	assert.Equal(t, before.RemainQuota-80, after.RemainQuota)
++	assert.Equal(t, before.UsedQuota+80, after.UsedQuota)
++	assert.Equal(t, before.Key, after.Key)
++	assert.Equal(t, before.Name, after.Name)
++	assert.Equal(t, before.ExpiredTime, after.ExpiredTime)
++	require.NotNil(t, after.StrictTextPolicy)
++	assert.Equal(t, *validTestPolicy(), *after.StrictTextPolicy)
++	require.NoError(t, after.ValidateStrictTextPolicy())
++}
++
++func TestStrictTextPolicyPersistedGuards(t *testing.T) {
++	for _, mutation := range []func(*Token){
++		func(t *Token) { t.UnlimitedQuota = true },
++		func(t *Token) { t.ModelLimitsEnabled = false },
++		func(t *Token) { t.ModelLimits = "a,b" },
++	} {
++		token := Token{ModelLimitsEnabled: true, ModelLimits: "model-a", StrictTextPolicy: validTestPolicy()}
++		mutation(&token)
++		require.Error(t, token.ValidateStrictTextPolicy())
++	}
++}
+diff --git a/model/strict_text_reservation.go b/model/strict_text_reservation.go
+new file mode 100644
+index 000000000..b5baabe39
+--- /dev/null
++++ b/model/strict_text_reservation.go
+@@ -0,0 +1,663 @@
++package model
++
++import (
++	"crypto/sha256"
++	"errors"
++	"fmt"
++
++	"github.com/QuantumNous/new-api/common"
++
++	"gorm.io/gorm"
++)
++
++// Strict reservation states for durable wallet-backed strict-text accounting.
++// Only RESERVED rows may be refunded after a restart; DISPATCHED rows stay
++// held for an operator verdict because a missing consume log is NOT proof
++// that the upstream call never happened. Logs may live in a separate
++// database, so this table never assumes an atomic cross-DB commit with them.
++const (
++	StrictReservationReserved   = "RESERVED"
++	StrictReservationDispatched = "DISPATCHED"
++	StrictReservationSettled    = "SETTLED"
++	StrictReservationRefunded   = "REFUNDED"
++)
++
++var (
++	ErrStrictReservationNotFound      = errors.New("strict reservation not found")
++	ErrStrictReservationConflict      = errors.New("strict reservation conflict")
++	ErrStrictReservationInsufficient  = errors.New("strict reservation insufficient quota")
++	ErrStrictReservationHeld          = errors.New("strict reservation dispatched; held, no automatic refund")
++	ErrStrictReservationSyncMode      = errors.New("strict reservation requires synchronous database balances: disable Redis quota cache and batch updates, or invalidate them around these calls")
++	ErrStrictReservationCapExceeded   = errors.New("strict reservation actual quota exceeds reserved quota")
++	ErrStrictReservationInvalidInput  = errors.New("strict reservation invalid input")
++	ErrStrictReservationTokenMismatch = errors.New("strict reservation token mismatch")
++)
++
++// StrictTextReservation is the durable wallet-leg reservation for one strict
++// request. Balances stay in the existing stores (users.quota and
++// tokens.remain_quota/used_quota); this row is the write-ahead record, not a
++// second ledger. request_id is unique: a repeated reserve with the identical
++// snapshot replays, any differing snapshot or illegal transition rejects.
++type StrictTextReservation struct {
++	Id              int     `json:"id"`
++	RequestId       string  `json:"request_id" gorm:"type:varchar(64);uniqueIndex"`
++	UserId          int     `json:"user_id" gorm:"index"`
++	TokenId         int     `json:"token_id" gorm:"index"`
++	TokenKeyHash    string  `json:"-" gorm:"type:varchar(64)"`
++	ChannelId       int     `json:"channel_id" gorm:"index"`
++	Model           string  `json:"model" gorm:"type:varchar(128)"`
++	InputRate       float64 `json:"input_rate"`
++	OutputRate      float64 `json:"output_rate"`
++	CacheRate       float64 `json:"cache_rate"`
++	ContextTokens   int     `json:"context_tokens"`
++	MaxOutputTokens int     `json:"max_output_tokens"`
++	ReasoningEffort string  `json:"reasoning_effort" gorm:"type:varchar(16)"`
++	ReservedQuota   int     `json:"reserved_quota"`
++	ActualQuota     int     `json:"actual_quota"`
++	// Known-result fields: a DISPATCHED row carries no usage until the
++	// upstream verdict is durably recorded. Only a recorded result may be
++	// recovered after a restart; an unrecorded DISPATCHED row stays held.
++	ActualPromptTokens     int    `json:"actual_prompt_tokens"`
++	ActualCompletionTokens int    `json:"actual_completion_tokens"`
++	ResultRecorded         bool   `json:"result_recorded"`
++	State                  string `json:"state" gorm:"type:varchar(16);index"`
++	CreatedAt              int64  `json:"created_at" gorm:"bigint"`
++	UpdatedAt              int64  `json:"updated_at" gorm:"bigint;index"`
++}
++
++func (r *StrictTextReservation) BeforeCreate(tx *gorm.DB) error {
++	now := common.GetTimestamp()
++	r.CreatedAt = now
++	r.UpdatedAt = now
++	return nil
++}
++
++func (r *StrictTextReservation) BeforeUpdate(tx *gorm.DB) error {
++	r.UpdatedAt = common.GetTimestamp()
++	return nil
++}
++
++// StrictReservationInput carries the immutable snapshot bound at reserve time.
++type StrictReservationInput struct {
++	RequestId     string
++	UserId        int
++	TokenId       int
++	TokenKey      string
++	ChannelId     int
++	Model         string
++	Policy        StrictTextPolicy
++	ReservedQuota int
++}
++
++func requireStrictSyncMode() error {
++	if common.RedisEnabled || common.BatchUpdateEnabled {
++		return ErrStrictReservationSyncMode
++	}
++	return nil
++}
++
++func validateStrictReservationInput(input StrictReservationInput) error {
++	if input.RequestId == "" || len(input.RequestId) > 64 {
++		return fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	if input.UserId <= 0 || input.TokenId <= 0 {
++		return fmt.Errorf("%w: user and token ids must be positive", ErrStrictReservationInvalidInput)
++	}
++	if input.TokenKey == "" {
++		return fmt.Errorf("%w: token key is empty", ErrStrictReservationInvalidInput)
++	}
++	if input.ChannelId < 0 {
++		return fmt.Errorf("%w: channel id must not be negative", ErrStrictReservationInvalidInput)
++	}
++	if input.ReservedQuota <= 0 {
++		return fmt.Errorf("%w: reserved quota must be positive", ErrStrictReservationInvalidInput)
++	}
++	if err := common.ValidateWalletQuota(input.ReservedQuota); err != nil {
++		return fmt.Errorf("%w: %w", ErrStrictReservationInvalidInput, err)
++	}
++	if _, ok := StrictPolicySingleModel(input.Model); !ok || len(input.Model) > 128 {
++		return fmt.Errorf("%w: model must be exactly one name", ErrStrictReservationInvalidInput)
++	}
++	if err := input.Policy.Validate(); err != nil {
++		return fmt.Errorf("%w: %w", ErrStrictReservationInvalidInput, err)
++	}
++	return nil
++}
++
++func sameStrictSnapshot(row *StrictTextReservation, input StrictReservationInput) bool {
++	return row.UserId == input.UserId &&
++		row.ChannelId == input.ChannelId &&
++		row.TokenId == input.TokenId &&
++		row.TokenKeyHash == fmt.Sprintf("%x", sha256.Sum256([]byte(input.TokenKey))) &&
++		row.Model == input.Model &&
++		row.InputRate == input.Policy.InputRate &&
++		row.OutputRate == input.Policy.OutputRate &&
++		row.CacheRate == input.Policy.CacheRate &&
++		row.ContextTokens == input.Policy.ContextTokens &&
++		row.MaxOutputTokens == input.Policy.MaxOutputTokens &&
++		row.ReasoningEffort == input.Policy.ReasoningEffort &&
++		row.ReservedQuota == input.ReservedQuota
++}
++
++// ReserveStrictTextWalletReservation atomically deducts ReservedQuota from
++// BOTH users.quota and tokens.remain_quota (used_quota rises by the same
++// amount) and inserts the RESERVED row in one transaction. A repeated call
++// with the identical snapshot returns the existing row without deducting
++// again; a reused request_id with any differing field rejects.
++func ReserveStrictTextWalletReservation(input StrictReservationInput) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	if err := validateStrictReservationInput(input); err != nil {
++		return nil, err
++	}
++	row := &StrictTextReservation{}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var existing StrictTextReservation
++		lookup := tx.Where("request_id = ?", input.RequestId).First(&existing)
++		if lookup.Error == nil {
++			if existing.State == StrictReservationReserved && sameStrictSnapshot(&existing, input) {
++				*row = existing
++				return nil
++			}
++			return fmt.Errorf("%w: request_id %q already recorded in state %s",
++				ErrStrictReservationConflict, input.RequestId, existing.State)
++		}
++		if !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
++			return lookup.Error
++		}
++		var token Token
++		if err := lockForUpdate(tx).Where("id = ?", input.TokenId).First(&token).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("%w: token %d: %w", ErrStrictReservationTokenMismatch, input.TokenId, ErrStrictReservationNotFound)
++			}
++			return err
++		}
++		if token.Key != input.TokenKey || token.UserId != input.UserId {
++			return fmt.Errorf("%w: token %d is not owned by this user/key",
++				ErrStrictReservationTokenMismatch, input.TokenId)
++		}
++		if token.StrictTextPolicy != nil && (token.ModelLimits != input.Model || *token.StrictTextPolicy != input.Policy) {
++			return ErrStrictReservationTokenMismatch
++		}
++		if token.UnlimitedQuota {
++			return fmt.Errorf("%w: strict reservation requires a finite token quota",
++				ErrStrictReservationTokenMismatch)
++		}
++		wallet := tx.Model(&User{}).
++			Where("id = ? AND quota >= ?", input.UserId, input.ReservedQuota).
++			Update("quota", gorm.Expr("quota - ?", input.ReservedQuota))
++		if wallet.Error != nil {
++			return wallet.Error
++		}
++		if wallet.RowsAffected != 1 {
++			return fmt.Errorf("%w: wallet quota insufficient for user %d",
++				ErrStrictReservationInsufficient, input.UserId)
++		}
++		leg := tx.Model(&Token{}).
++			Where("id = ? AND remain_quota >= ?", input.TokenId, input.ReservedQuota).
++			Updates(map[string]any{
++				"remain_quota":  gorm.Expr("remain_quota - ?", input.ReservedQuota),
++				"used_quota":    gorm.Expr("used_quota + ?", input.ReservedQuota),
++				"accessed_time": common.GetTimestamp(),
++			})
++		if leg.Error != nil {
++			return leg.Error
++		}
++		if leg.RowsAffected != 1 {
++			return fmt.Errorf("%w: token quota insufficient for token %d",
++				ErrStrictReservationInsufficient, input.TokenId)
++		}
++		*row = StrictTextReservation{
++			RequestId:       input.RequestId,
++			UserId:          input.UserId,
++			TokenId:         input.TokenId,
++			TokenKeyHash:    fmt.Sprintf("%x", sha256.Sum256([]byte(input.TokenKey))),
++			ChannelId:       input.ChannelId,
++			Model:           input.Model,
++			InputRate:       input.Policy.InputRate,
++			OutputRate:      input.Policy.OutputRate,
++			CacheRate:       input.Policy.CacheRate,
++			ContextTokens:   input.Policy.ContextTokens,
++			MaxOutputTokens: input.Policy.MaxOutputTokens,
++			ReasoningEffort: input.Policy.ReasoningEffort,
++			ReservedQuota:   input.ReservedQuota,
++			State:           StrictReservationReserved,
++		}
++		return tx.Create(row).Error
++	})
++	if err != nil {
++		return nil, err
++	}
++	return row, nil
++}
++
++// MarkStrictTextReservationDispatched flips RESERVED to DISPATCHED before the
++// upstream network call. A DISPATCHED row refuses a second dispatch;
++// any other state rejects.
++func MarkStrictTextReservationDispatched(requestId string) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	if requestId == "" {
++		return nil, fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	row := &StrictTextReservation{}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		flipped := tx.Model(&StrictTextReservation{}).
++			Where("request_id = ? AND state = ?", requestId, StrictReservationReserved).
++			Updates(map[string]any{
++				"state":      StrictReservationDispatched,
++				"updated_at": common.GetTimestamp(),
++			})
++		if flipped.Error != nil {
++			return flipped.Error
++		}
++		if flipped.RowsAffected == 1 {
++			return tx.Where("request_id = ?", requestId).First(row).Error
++		}
++		return readStrictReservationTx(tx, requestId, row, func(existing *StrictTextReservation) error {
++			if existing.State == StrictReservationDispatched {
++				return ErrStrictReservationHeld // never authorize a second network dispatch
++			}
++			return fmt.Errorf("%w: cannot dispatch from state %s",
++				ErrStrictReservationConflict, existing.State)
++		})
++	})
++	if err != nil {
++		return nil, err
++	}
++	return row, nil
++}
++
++// RecordStrictTextResult durably retains one known upstream verdict on a
++// DISPATCHED row before settlement: input/output usage plus the actual quota
++// the service layer derived from them. Repeating the identical verdict
++// replays; any differing verdict rejects. Rows in any other state reject, so
++// a result can never be attached before dispatch or after terminality.
++func RecordStrictTextResult(requestId string, promptTokens, completionTokens, actualQuota int) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	if requestId == "" {
++		return nil, fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	if promptTokens < 1 {
++		return nil, fmt.Errorf("%w: prompt tokens must be positive", ErrStrictReservationInvalidInput)
++	}
++	if completionTokens < 0 {
++		return nil, fmt.Errorf("%w: completion tokens must not be negative", ErrStrictReservationInvalidInput)
++	}
++	if actualQuota < 0 {
++		return nil, fmt.Errorf("%w: actual quota must not be negative", ErrStrictReservationInvalidInput)
++	}
++	if err := common.ValidateWalletQuota(actualQuota); err != nil {
++		return nil, fmt.Errorf("%w: %w", ErrStrictReservationInvalidInput, err)
++	}
++	row := &StrictTextReservation{}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var existing StrictTextReservation
++		if err := lockForUpdate(tx).Where("request_id = ?", requestId).First(&existing).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("%w: %q", ErrStrictReservationNotFound, requestId)
++			}
++			return err
++		}
++		if existing.State != StrictReservationDispatched {
++			return fmt.Errorf("%w: cannot record a result in state %s",
++				ErrStrictReservationConflict, existing.State)
++		}
++		if existing.ResultRecorded {
++			if existing.ActualPromptTokens != promptTokens ||
++				existing.ActualCompletionTokens != completionTokens ||
++				existing.ActualQuota != actualQuota {
++				return fmt.Errorf("%w: a different verdict is already recorded",
++					ErrStrictReservationConflict)
++			}
++			*row = existing
++			return nil
++		}
++		if actualQuota > existing.ReservedQuota {
++			return fmt.Errorf("%w: actual %d exceeds reserved %d",
++				ErrStrictReservationCapExceeded, actualQuota, existing.ReservedQuota)
++		}
++		flipped := tx.Model(&StrictTextReservation{}).
++			Where("request_id = ? AND state = ? AND (result_recorded = ? OR result_recorded IS NULL)", requestId, StrictReservationDispatched, false).
++			Updates(map[string]any{
++				"actual_prompt_tokens":     promptTokens,
++				"actual_completion_tokens": completionTokens,
++				"actual_quota":             actualQuota,
++				"result_recorded":          true,
++				"updated_at":               common.GetTimestamp(),
++			})
++		if flipped.Error != nil {
++			return flipped.Error
++		}
++		if flipped.RowsAffected != 1 {
++			return fmt.Errorf("%w: reservation changed concurrently",
++				ErrStrictReservationConflict)
++		}
++		return tx.Where("request_id = ?", requestId).First(row).Error
++	})
++	if err != nil {
++		return nil, err
++	}
++	return row, nil
++}
++
++// RecoverRecordedStrictTextResult settles a DISPATCHED row that already
++// carries a recorded known result, using exactly that recorded actual. It is
++// the restart-recovery entry point: idempotent, single-commit, and safe to
++// retry. A DISPATCHED row without a recorded result stays held; any other
++// state resolves through the ordinary settle/refund transitions.
++func RecoverRecordedStrictTextResult(requestId string) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	row, err := GetStrictTextReservation(requestId)
++	if err != nil {
++		return nil, err
++	}
++	if row.State == StrictReservationSettled {
++		return row, nil
++	}
++	if row.State != StrictReservationDispatched || !row.ResultRecorded {
++		if row.State == StrictReservationDispatched {
++			return nil, fmt.Errorf("%w: %q", ErrStrictReservationHeld, requestId)
++		}
++		return nil, fmt.Errorf("%w: cannot recover from state %s",
++			ErrStrictReservationConflict, row.State)
++	}
++	return SettleStrictTextReservation(requestId, row.ActualQuota)
++}
++
++// SettleStrictTextReservation settles actualQuota (0 <= actual <= reserved,
++// the strict cap) from RESERVED or DISPATCHED, returning the
++// reserved-actual delta to BOTH balances atomically with the state flip.
++// Balance, usage statistics and the row commit in ONE transaction, so the
++// statistics can never run ahead of the money. A DISPATCHED row with a
++// recorded verdict only settles with exactly that recorded actual.
++// Repeating with the same actual replays; a different actual rejects.
++func SettleStrictTextReservation(requestId string, actualQuota int) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	if requestId == "" {
++		return nil, fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	if actualQuota < 0 {
++		return nil, fmt.Errorf("%w: actual quota must not be negative", ErrStrictReservationInvalidInput)
++	}
++	if err := common.ValidateWalletQuota(actualQuota); err != nil {
++		return nil, fmt.Errorf("%w: %w", ErrStrictReservationInvalidInput, err)
++	}
++	row := &StrictTextReservation{}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var existing StrictTextReservation
++		if err := lockForUpdate(tx).Where("request_id = ?", requestId).First(&existing).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("%w: %q", ErrStrictReservationNotFound, requestId)
++			}
++			return err
++		}
++		if existing.State == StrictReservationSettled {
++			if existing.ActualQuota != actualQuota {
++				return fmt.Errorf("%w: already settled with actual %d, not %d",
++					ErrStrictReservationConflict, existing.ActualQuota, actualQuota)
++			}
++			*row = existing
++			return nil
++		}
++		if existing.State != StrictReservationReserved && existing.State != StrictReservationDispatched {
++			return fmt.Errorf("%w: cannot settle from state %s",
++				ErrStrictReservationConflict, existing.State)
++		}
++		if existing.State == StrictReservationDispatched && existing.ResultRecorded && existing.ActualQuota != actualQuota {
++			return fmt.Errorf("%w: recorded actual is %d, not %d",
++				ErrStrictReservationConflict, existing.ActualQuota, actualQuota)
++		}
++		if actualQuota > existing.ReservedQuota {
++			return fmt.Errorf("%w: actual %d exceeds reserved %d",
++				ErrStrictReservationCapExceeded, actualQuota, existing.ReservedQuota)
++		}
++		if delta := existing.ReservedQuota - actualQuota; delta > 0 {
++			if err := creditStrictBalancesTx(tx, &existing, delta); err != nil {
++				return err
++			}
++		}
++		if err := debitStrictStatsTx(tx, &existing, actualQuota); err != nil {
++			return err
++		}
++		flipped := tx.Model(&StrictTextReservation{}).
++			Where("request_id = ? AND state = ?", requestId, existing.State).
++			Updates(map[string]any{
++				"state":        StrictReservationSettled,
++				"actual_quota": actualQuota,
++				"updated_at":   common.GetTimestamp(),
++			})
++		if flipped.Error != nil {
++			return flipped.Error
++		}
++		if flipped.RowsAffected != 1 {
++			return fmt.Errorf("%w: reservation changed concurrently",
++				ErrStrictReservationConflict)
++		}
++		return tx.Where("request_id = ?", requestId).First(row).Error
++	})
++	if err != nil {
++		return nil, err
++	}
++	return row, nil
++}
++
++// RefundStrictTextReservation refunds the full reserved amount to BOTH
++// balances atomically with the RESERVED to REFUNDED flip. DISPATCHED rows
++// reject and stay held; an already REFUNDED row replays. Callers recover
++// RESERVED rows after a restart only under caller-owned quiescence.
++func RefundStrictTextReservation(requestId string) (*StrictTextReservation, error) {
++	if err := requireStrictSyncMode(); err != nil {
++		return nil, err
++	}
++	if requestId == "" {
++		return nil, fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	row := &StrictTextReservation{}
++	err := DB.Transaction(func(tx *gorm.DB) error {
++		var existing StrictTextReservation
++		if err := lockForUpdate(tx).Where("request_id = ?", requestId).First(&existing).Error; err != nil {
++			if errors.Is(err, gorm.ErrRecordNotFound) {
++				return fmt.Errorf("%w: %q", ErrStrictReservationNotFound, requestId)
++			}
++			return err
++		}
++		if existing.State == StrictReservationRefunded {
++			*row = existing
++			return nil
++		}
++		if existing.State == StrictReservationDispatched {
++			return fmt.Errorf("%w: %q", ErrStrictReservationHeld, requestId)
++		}
++		if existing.State != StrictReservationReserved {
++			return fmt.Errorf("%w: cannot refund from state %s",
++				ErrStrictReservationConflict, existing.State)
++		}
++		if err := creditStrictBalancesTx(tx, &existing, existing.ReservedQuota); err != nil {
++			return err
++		}
++		flipped := tx.Model(&StrictTextReservation{}).
++			Where("request_id = ? AND state = ?", requestId, StrictReservationReserved).
++			Updates(map[string]any{
++				"state":      StrictReservationRefunded,
++				"updated_at": common.GetTimestamp(),
++			})
++		if flipped.Error != nil {
++			return flipped.Error
++		}
++		if flipped.RowsAffected != 1 {
++			return fmt.Errorf("%w: reservation changed concurrently",
++				ErrStrictReservationConflict)
++		}
++		return tx.Where("request_id = ?", requestId).First(row).Error
++	})
++	if err != nil {
++		return nil, err
++	}
++	return row, nil
++}
++
++// creditStrictBalancesTx returns amount to the wallet and the token leg
++// inside the caller's transaction: used_quota moves back consistently, so a
++// fully refunded reservation leaves remain and used exactly as before.
++func creditStrictBalancesTx(tx *gorm.DB, row *StrictTextReservation, amount int) error {
++	wallet := tx.Model(&User{}).
++		Where("id = ? AND quota <= ?", row.UserId, common.MaxWalletQuota-amount).
++		Update("quota", gorm.Expr("quota + ?", amount))
++	if wallet.Error != nil {
++		return wallet.Error
++	}
++	if wallet.RowsAffected != 1 {
++		return fmt.Errorf("%w: wallet credit would exceed the cap or user %d is gone",
++			ErrStrictReservationConflict, row.UserId)
++	}
++	leg := tx.Model(&Token{}).
++		Where("id = ? AND user_id = ? AND remain_quota <= ? AND used_quota >= ?", row.TokenId, row.UserId, common.MaxWalletQuota-amount, amount).
++		Updates(map[string]any{
++			"remain_quota":  gorm.Expr("remain_quota + ?", amount),
++			"used_quota":    gorm.Expr("used_quota - ?", amount),
++			"accessed_time": common.GetTimestamp(),
++		})
++	if leg.Error != nil {
++		return leg.Error
++	}
++	if leg.RowsAffected != 1 {
++		return fmt.Errorf("%w: token %d is gone", ErrStrictReservationConflict, row.TokenId)
++	}
++	return nil
++}
++
++// debitStrictStatsTx records one settled request's usage statistics inside
++// the caller's settlement transaction: the user leg, the token leg via the
++// reserve/credit pair, and the channel leg. Statistics and money share one
++// commit; a failed settlement leaves no statistics behind. Replays return
++// before this runs, so each settlement counts exactly once.
++func debitStrictStatsTx(tx *gorm.DB, row *StrictTextReservation, actualQuota int) error {
++	user := tx.Model(&User{}).Where("id = ?", row.UserId).Updates(map[string]any{
++		"used_quota":    gorm.Expr("used_quota + ?", actualQuota),
++		"request_count": gorm.Expr("request_count + ?", 1),
++	})
++	if user.Error != nil {
++		return user.Error
++	}
++	if user.RowsAffected != 1 {
++		return fmt.Errorf("%w: user %d is gone", ErrStrictReservationConflict, row.UserId)
++	}
++	if row.ChannelId > 0 && actualQuota > 0 {
++		channel := tx.Model(&Channel{}).Where("id = ?", row.ChannelId).
++			Update("used_quota", gorm.Expr("used_quota + ?", actualQuota))
++		if channel.Error != nil {
++			return channel.Error
++		}
++		if channel.RowsAffected != 1 {
++			return fmt.Errorf("%w: channel %d is gone", ErrStrictReservationConflict, row.ChannelId)
++		}
++	}
++	return nil
++}
++
++func readStrictReservationTx(tx *gorm.DB, requestId string, row *StrictTextReservation, check func(*StrictTextReservation) error) error {
++	var existing StrictTextReservation
++	if err := tx.Where("request_id = ?", requestId).First(&existing).Error; err != nil {
++		if errors.Is(err, gorm.ErrRecordNotFound) {
++			return fmt.Errorf("%w: %q", ErrStrictReservationNotFound, requestId)
++		}
++		return err
++	}
++	if check != nil {
++		if err := check(&existing); err != nil {
++			return err
++		}
++	}
++	*row = existing
++	return nil
++}
++
++// GetStrictTextReservation reads one reservation by request id for status and
++// recovery inspection. It never mutates.
++func GetStrictTextReservation(requestId string) (*StrictTextReservation, error) {
++	if requestId == "" {
++		return nil, fmt.Errorf("%w: request_id is empty", ErrStrictReservationInvalidInput)
++	}
++	row := &StrictTextReservation{}
++	if err := DB.Where("request_id = ?", requestId).First(row).Error; err != nil {
++		if errors.Is(err, gorm.ErrRecordNotFound) {
++			return nil, fmt.Errorf("%w: %q", ErrStrictReservationNotFound, requestId)
++		}
++		return nil, err
++	}
++	return row, nil
++}
++
++// ListUnresolvedStrictTextReservations returns RESERVED and DISPATCHED rows
++// for the startup scan. Recovery refunds RESERVED rows only under
++// caller-owned quiescence; DISPATCHED rows stay held.
++func ListUnresolvedStrictTextReservations(limit int) ([]StrictTextReservation, error) {
++	if limit <= 0 {
++		limit = 200
++	}
++	var rows []StrictTextReservation
++	if err := DB.Where("state IN ?", []string{StrictReservationReserved, StrictReservationDispatched}).
++		Order("id asc").Limit(limit).Find(&rows).Error; err != nil {
++		return nil, err
++	}
++	return rows, nil
++}
++
++// StrictReservationSummary reports pending operations, never a second balance.
++type StrictReservationSummary struct {
++	ReservedCount          int64 `json:"reserved_count"`
++	DispatchedCount        int64 `json:"dispatched_count"`
++	HeldQuota              int64 `json:"held_quota"`
++	SettledCount           int64 `json:"settled_count"`
++	SettledQuota           int64 `json:"settled_quota"`
++	InputTokens            int64 `json:"input_tokens"`
++	OutputTokens           int64 `json:"output_tokens"`
++	UnrecordedSettledCount int64 `json:"unrecorded_settled_count"`
++}
++
++func StrictTextReservationSummary(tokenID int) (*StrictReservationSummary, error) {
++	result := &StrictReservationSummary{}
++	err := DB.Model(&StrictTextReservation{}).Where("token_id = ?", tokenID).
++		Select("COALESCE(SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),0) AS reserved_count, "+
++			"COALESCE(SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),0) AS dispatched_count, "+
++			"COALESCE(SUM(CASE WHEN state IN (?,?) THEN reserved_quota ELSE 0 END),0) AS held_quota, "+
++			"COALESCE(SUM(CASE WHEN state = ? THEN 1 ELSE 0 END),0) AS settled_count, "+
++			"COALESCE(SUM(CASE WHEN state = ? THEN actual_quota ELSE 0 END),0) AS settled_quota, "+
++			"COALESCE(SUM(CASE WHEN state = ? AND result_recorded = ? THEN actual_prompt_tokens ELSE 0 END),0) AS input_tokens, "+
++			"COALESCE(SUM(CASE WHEN state = ? AND result_recorded = ? THEN actual_completion_tokens ELSE 0 END),0) AS output_tokens, "+
++			"COALESCE(SUM(CASE WHEN state = ? AND (result_recorded = ? OR result_recorded IS NULL) THEN 1 ELSE 0 END),0) AS unrecorded_settled_count",
++			StrictReservationReserved, StrictReservationDispatched, StrictReservationReserved, StrictReservationDispatched,
++			StrictReservationSettled, StrictReservationSettled, StrictReservationSettled, true,
++			StrictReservationSettled, true, StrictReservationSettled, false).
++		Scan(result).Error
++	return result, err
++}
++
++// RecoverUndispatchedStrictTextReservations runs only before serving requests
++// in the explicitly selected single-process seller startup. No age heuristic,
++// missing-log inference or DISPATCHED refund is allowed.
++func RecoverUndispatchedStrictTextReservations() error {
++	for {
++		var rows []StrictTextReservation
++		if err := DB.Where("state = ?", StrictReservationReserved).Order("id").Limit(100).Find(&rows).Error; err != nil {
++			return err
++		}
++		if len(rows) == 0 {
++			return nil
++		}
++		for _, row := range rows {
++			if _, err := RefundStrictTextReservation(row.RequestId); err != nil {
++				return err
++			}
++		}
++	}
++}
+diff --git a/model/strict_text_reservation_test.go b/model/strict_text_reservation_test.go
+new file mode 100644
+index 000000000..4c9c53f77
+--- /dev/null
++++ b/model/strict_text_reservation_test.go
+@@ -0,0 +1,457 @@
++package model
++
++import (
++	"errors"
++	"sync"
++	"testing"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func userStatsNow(t *testing.T, userID int) (usedQuota, requestCount int) {
++	t.Helper()
++	var user User
++	require.NoError(t, DB.Select("used_quota", "request_count").First(&user, userID).Error)
++	return user.UsedQuota, user.RequestCount
++}
++
++func channelUsedNow(t *testing.T, channelID int) int64 {
++	t.Helper()
++	var channel Channel
++	require.NoError(t, DB.Select("used_quota").First(&channel, channelID).Error)
++	return channel.UsedQuota
++}
++
++func createStrictChannel(t *testing.T) Channel {
++	t.Helper()
++	channel := Channel{Name: "strict-channel", Key: "sk-strict", Status: common.ChannelStatusEnabled}
++	require.NoError(t, DB.Create(&channel).Error)
++	t.Cleanup(func() { DB.Delete(&Channel{}, channel.Id) })
++	return channel
++}
++
++var migrateStrictReservationOnce sync.Once
++
++func migrateStrictReservation(t *testing.T) {
++	t.Helper()
++	migrateStrictReservationOnce.Do(func() {
++		require.NoError(t, DB.AutoMigrate(&StrictTextReservation{}))
++	})
++}
++
++func cleanStrictReservations(t *testing.T) {
++	t.Helper()
++	migrateStrictReservation(t)
++	truncateTables(t)
++	require.NoError(t, DB.Exec("DELETE FROM strict_text_reservations").Error)
++	t.Cleanup(func() {
++		DB.Exec("DELETE FROM strict_text_reservations")
++	})
++}
++
++func strictReservationPolicy() StrictTextPolicy {
++	return StrictTextPolicy{
++		InputRate:       2,
++		OutputRate:      4,
++		CacheRate:       1,
++		ContextTokens:   4096,
++		MaxOutputTokens: 256,
++		ReasoningEffort: "low",
++	}
++}
++
++func setupStrictReservationPair(t *testing.T, userQuota, tokenQuota int) (User, Token) {
++	t.Helper()
++	user := createReserveTestUser(t, userQuota)
++	token := createReserveTestToken(t, tokenQuota)
++	token.UserId = user.Id
++	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).Update("user_id", user.Id).Error)
++	token.UserId = user.Id
++	return user, token
++}
++
++func strictReservationInput(user User, token Token, requestId string, quota int) StrictReservationInput {
++	return StrictReservationInput{
++		RequestId:     requestId,
++		UserId:        user.Id,
++		TokenId:       token.Id,
++		TokenKey:      token.Key,
++		Model:         "punch-test-model",
++		Policy:        strictReservationPolicy(),
++		ReservedQuota: quota,
++	}
++}
++
++func TestStrictReservationReserveSettlesBothLegs(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	row, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-happy-1", 230))
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationReserved, row.State)
++	assert.Equal(t, 230, row.ReservedQuota)
++	assert.Equal(t, "punch-test-model", row.Model)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++	reloaded := getTokenFromDB(t, token.Id)
++	assert.Equal(t, 770, reloaded.RemainQuota)
++	assert.Equal(t, 230, reloaded.UsedQuota)
++
++	dispatched, err := MarkStrictTextReservationDispatched("strict-happy-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationDispatched, dispatched.State)
++	_, replayErr := MarkStrictTextReservationDispatched("strict-happy-1")
++	require.ErrorIs(t, replayErr, ErrStrictReservationHeld)
++
++	settled, err := SettleStrictTextReservation("strict-happy-1", 200)
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, settled.State)
++	assert.Equal(t, 200, settled.ActualQuota)
++	assert.Equal(t, 800, getUserQuotaFromDB(t, user.Id))
++	reloaded = getTokenFromDB(t, token.Id)
++	assert.Equal(t, 800, reloaded.RemainQuota)
++	assert.Equal(t, 200, reloaded.UsedQuota)
++}
++
++func TestStrictReservationRefundReservedRestoresBothLegs(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-refund-1", 230))
++	require.NoError(t, err)
++
++	refunded, err := RefundStrictTextReservation("strict-refund-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationRefunded, refunded.State)
++	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id))
++	reloaded := getTokenFromDB(t, token.Id)
++	assert.Equal(t, 1000, reloaded.RemainQuota)
++	assert.Equal(t, 0, reloaded.UsedQuota)
++
++	replayed, err := RefundStrictTextReservation("strict-refund-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationRefunded, replayed.State)
++	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id))
++}
++
++func TestStrictReservationDispatchedStaysHeld(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-held-1", 230))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-held-1")
++	require.NoError(t, err)
++
++	_, err = RefundStrictTextReservation("strict-held-1")
++	require.ErrorIs(t, err, ErrStrictReservationHeld)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++	reloaded := getTokenFromDB(t, token.Id)
++	assert.Equal(t, 770, reloaded.RemainQuota)
++	assert.Equal(t, 230, reloaded.UsedQuota)
++
++	// A missing consume log must not unlock the hold: unresolved read still
++	// reports the row as DISPATCHED, never as refundable.
++	unresolved, err := ListUnresolvedStrictTextReservations(10)
++	require.NoError(t, err)
++	require.Len(t, unresolved, 1)
++	assert.Equal(t, StrictReservationDispatched, unresolved[0].State)
++
++	// The verdict path still settles exactly once afterwards.
++	_, err = SettleStrictTextReservation("strict-held-1", 230)
++	require.NoError(t, err)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++}
++
++func TestStrictReservationReplayAndConflict(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	input := strictReservationInput(user, token, "strict-replay-1", 230)
++	first, err := ReserveStrictTextWalletReservation(input)
++	require.NoError(t, err)
++
++	second, err := ReserveStrictTextWalletReservation(input)
++	require.NoError(t, err)
++	assert.Equal(t, first.Id, second.Id)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++
++	conflicting := input
++	conflicting.ReservedQuota = 200
++	_, err = ReserveStrictTextWalletReservation(conflicting)
++	require.ErrorIs(t, err, ErrStrictReservationConflict)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++
++	_, err = SettleStrictTextReservation("strict-replay-1", 200)
++	require.NoError(t, err)
++	_, err = SettleStrictTextReservation("strict-replay-1", 210)
++	require.ErrorIs(t, err, ErrStrictReservationConflict)
++	resettled, err := SettleStrictTextReservation("strict-replay-1", 200)
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, resettled.State)
++}
++
++func TestStrictReservationCapAndInsufficient(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-cap-1", 230))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-cap-1")
++	require.NoError(t, err)
++
++	_, err = SettleStrictTextReservation("strict-cap-1", 231)
++	require.ErrorIs(t, err, ErrStrictReservationCapExceeded)
++	still, err := GetStrictTextReservation("strict-cap-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationDispatched, still.State)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++
++	_, err = ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-poor-wallet", 771))
++	require.ErrorIs(t, err, ErrStrictReservationInsufficient)
++	_, err = ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-poor-token", 771))
++	require.ErrorIs(t, err, ErrStrictReservationInsufficient)
++	_, err = GetStrictTextReservation("strict-poor-wallet")
++	require.ErrorIs(t, err, ErrStrictReservationNotFound)
++	_, err = GetStrictTextReservation("strict-poor-token")
++	require.ErrorIs(t, err, ErrStrictReservationNotFound)
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++	assert.Equal(t, 770, getTokenFromDB(t, token.Id).RemainQuota)
++}
++
++func TestStrictReservationConcurrentReserveDeductsOnce(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	input := strictReservationInput(user, token, "strict-race-1", 230)
++
++	const callers = 8
++	results := make([]*StrictTextReservation, callers)
++	errs := make([]error, callers)
++	var wg sync.WaitGroup
++	for i := range callers {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			results[i], errs[i] = ReserveStrictTextWalletReservation(input)
++		}(i)
++	}
++	wg.Wait()
++	for i := range callers {
++		require.NoError(t, errs[i], "caller %d", i)
++		assert.Equal(t, results[0].Id, results[i].Id, "caller %d", i)
++	}
++	assert.Equal(t, 770, getUserQuotaFromDB(t, user.Id))
++	reloaded := getTokenFromDB(t, token.Id)
++	assert.Equal(t, 770, reloaded.RemainQuota)
++	assert.Equal(t, 230, reloaded.UsedQuota)
++}
++
++func TestStrictReservationRejectsSyncModeViolations(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	input := strictReservationInput(user, token, "strict-mode-1", 230)
++
++	common.RedisEnabled = true
++	_, err := ReserveStrictTextWalletReservation(input)
++	require.ErrorIs(t, err, ErrStrictReservationSyncMode)
++	common.RedisEnabled = false
++
++	common.BatchUpdateEnabled = true
++	_, err = ReserveStrictTextWalletReservation(input)
++	require.ErrorIs(t, err, ErrStrictReservationSyncMode)
++	common.BatchUpdateEnabled = false
++
++	_, err = GetStrictTextReservation("strict-mode-1")
++	require.ErrorIs(t, err, ErrStrictReservationNotFound)
++
++	bad := input
++	bad.RequestId = ""
++	_, err = ReserveStrictTextWalletReservation(bad)
++	require.ErrorIs(t, err, ErrStrictReservationInvalidInput)
++
++	otherToken := createReserveTestToken(t, 1000)
++	wrongKey := input
++	wrongKey.RequestId = "strict-mode-2"
++	wrongKey.TokenId = otherToken.Id
++	_, err = ReserveStrictTextWalletReservation(wrongKey)
++	require.ErrorIs(t, err, ErrStrictReservationTokenMismatch)
++	assert.True(t, errors.Is(err, ErrStrictReservationTokenMismatch))
++}
++
++func TestStrictReservationStartupRecoversOnlyUndispatchedOnce(t *testing.T) {
++	cleanStrictReservations(t)
++	user, token := setupStrictReservationPair(t, 1000, 1000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-start-reserved", 100))
++	require.NoError(t, err)
++	_, err = ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-start-dispatched", 200))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-start-dispatched")
++	require.NoError(t, err)
++	for range 2 {
++		require.NoError(t, RecoverUndispatchedStrictTextReservations())
++	}
++	assert.Equal(t, 800, getUserQuotaFromDB(t, user.Id))
++	assert.Equal(t, 800, getTokenFromDB(t, token.Id).RemainQuota)
++	summary, err := StrictTextReservationSummary(token.Id)
++	require.NoError(t, err)
++	assert.EqualValues(t, 0, summary.ReservedCount)
++	assert.EqualValues(t, 1, summary.DispatchedCount)
++	assert.EqualValues(t, 200, summary.HeldQuota)
++}
++
++func TestStrictReservationKnownResultRecordedBeforeSettle(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 2000, 2000)
++	channel := createStrictChannel(t)
++	input := strictReservationInput(user, token, "strict-known-1", 1000)
++	input.ChannelId = channel.Id
++	_, err := ReserveStrictTextWalletReservation(input)
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-known-1")
++	require.NoError(t, err)
++
++	// Old gap: a dispatched row carries no usage. The known upstream result
++	// must be durably retained before settlement instead of living in memory.
++	unresolved, err := GetStrictTextReservation("strict-known-1")
++	require.NoError(t, err)
++	assert.False(t, unresolved.ResultRecorded)
++	assert.Zero(t, unresolved.ActualPromptTokens)
++
++	recorded, err := RecordStrictTextResult("strict-known-1", 9, 1, 230)
++	require.NoError(t, err)
++	assert.True(t, recorded.ResultRecorded)
++	assert.Equal(t, 9, recorded.ActualPromptTokens)
++	assert.Equal(t, 1, recorded.ActualCompletionTokens)
++	assert.Equal(t, 230, recorded.ActualQuota)
++	assert.Equal(t, StrictReservationDispatched, recorded.State)
++
++	replayed, err := RecordStrictTextResult("strict-known-1", 9, 1, 230)
++	require.NoError(t, err)
++	assert.Equal(t, recorded.UpdatedAt, replayed.UpdatedAt)
++
++	_, err = RecordStrictTextResult("strict-known-1", 9, 2, 231)
++	require.ErrorIs(t, err, ErrStrictReservationConflict)
++
++	_, err = SettleStrictTextReservation("strict-known-1", 231)
++	require.ErrorIs(t, err, ErrStrictReservationConflict)
++	assert.Equal(t, 1000, getUserQuotaFromDB(t, user.Id))
++
++	settled, err := SettleStrictTextReservation("strict-known-1", 230)
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, settled.State)
++	assert.Equal(t, 1770, getUserQuotaFromDB(t, user.Id))
++	reloaded := getTokenFromDB(t, token.Id)
++	assert.Equal(t, 1770, reloaded.RemainQuota)
++	assert.Equal(t, 230, reloaded.UsedQuota)
++	used, count := userStatsNow(t, user.Id)
++	assert.Equal(t, 230, used)
++	assert.Equal(t, 1, count)
++	assert.EqualValues(t, 230, channelUsedNow(t, channel.Id))
++
++	resettled, err := SettleStrictTextReservation("strict-known-1", 230)
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, resettled.State)
++	used, count = userStatsNow(t, user.Id)
++	assert.Equal(t, 230, used, "replay must not double-count statistics")
++	assert.Equal(t, 1, count)
++	assert.EqualValues(t, 230, channelUsedNow(t, channel.Id))
++}
++
++func TestStrictReservationSettleWithoutRecordedResultKeepsLegacyCompat(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 2000, 2000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-norecord-1", 1000))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-norecord-1")
++	require.NoError(t, err)
++
++	// Direct callers that settle without a recorded result keep working;
++	// the row simply carries no usage.
++	settled, err := SettleStrictTextReservation("strict-norecord-1", 800)
++	require.NoError(t, err)
++	assert.False(t, settled.ResultRecorded)
++	assert.Equal(t, 1200, getUserQuotaFromDB(t, user.Id))
++	used, count := userStatsNow(t, user.Id)
++	assert.Equal(t, 800, used)
++	assert.Equal(t, 1, count)
++}
++
++func TestStrictReservationRecordValidation(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 2000, 2000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-recval-1", 1000))
++	require.NoError(t, err)
++
++	_, err = RecordStrictTextResult("strict-missing", 9, 1, 230)
++	require.ErrorIs(t, err, ErrStrictReservationNotFound)
++
++	_, err = RecordStrictTextResult("strict-recval-1", 9, 1, 230)
++	require.ErrorIs(t, err, ErrStrictReservationConflict, "no upstream result exists before dispatch")
++
++	_, err = MarkStrictTextReservationDispatched("strict-recval-1")
++	require.NoError(t, err)
++	for name, triple := range map[string][3]int{
++		"negative actual": {9, 1, -1},
++		"zero prompt":     {0, 1, 230},
++		"negative output": {9, -1, 230},
++	} {
++		_, err = RecordStrictTextResult("strict-recval-1", triple[0], triple[1], triple[2])
++		require.ErrorIs(t, err, ErrStrictReservationInvalidInput, name)
++	}
++	_, err = RecordStrictTextResult("strict-recval-1", 9, 1, 1001)
++	require.ErrorIs(t, err, ErrStrictReservationCapExceeded, "over cap")
++
++	_, err = RecordStrictTextResult("strict-recval-1", 9, 1, 230)
++	require.NoError(t, err)
++	_, err = SettleStrictTextReservation("strict-recval-1", 230)
++	require.NoError(t, err)
++	_, err = RecordStrictTextResult("strict-recval-1", 9, 1, 230)
++	require.ErrorIs(t, err, ErrStrictReservationConflict, "settled rows never accept a new result")
++	_, err = RefundStrictTextReservation("strict-recval-1")
++	require.Error(t, err, "settled rows never refund")
++}
++
++func TestStrictReservationRecordedRecoveryAfterRestart(t *testing.T) {
++	cleanStrictReservations(t)
++
++	user, token := setupStrictReservationPair(t, 2000, 2000)
++	_, err := ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-recover-1", 1000))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-recover-1")
++	require.NoError(t, err)
++	_, err = RecordStrictTextResult("strict-recover-1", 9, 1, 230)
++	require.NoError(t, err)
++
++	// Simulated restart: only durable state survives. The recorded known
++	// result settles exactly once with its own actual.
++	recovered, err := RecoverRecordedStrictTextResult("strict-recover-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, recovered.State)
++	assert.Equal(t, 1770, getUserQuotaFromDB(t, user.Id))
++	used, count := userStatsNow(t, user.Id)
++	assert.Equal(t, 230, used)
++	assert.Equal(t, 1, count)
++
++	again, err := RecoverRecordedStrictTextResult("strict-recover-1")
++	require.NoError(t, err)
++	assert.Equal(t, StrictReservationSettled, again.State)
++	used, count = userStatsNow(t, user.Id)
++	assert.Equal(t, 230, used)
++	assert.Equal(t, 1, count)
++
++	// A dispatched row WITHOUT a recorded result is still unknown: recovery
++	// refuses and the hold stays, even though no consume log exists.
++	_, err = ReserveStrictTextWalletReservation(strictReservationInput(user, token, "strict-recover-2", 500))
++	require.NoError(t, err)
++	_, err = MarkStrictTextReservationDispatched("strict-recover-2")
++	require.NoError(t, err)
++	_, err = RecoverRecordedStrictTextResult("strict-recover-2")
++	require.ErrorIs(t, err, ErrStrictReservationHeld)
++	assert.Equal(t, 1270, getUserQuotaFromDB(t, user.Id), "unknown dispatched hold untouched")
++}
+diff --git a/model/strict_token_gate.go b/model/strict_token_gate.go
+new file mode 100644
+index 000000000..6529f3db3
+--- /dev/null
++++ b/model/strict_token_gate.go
+@@ -0,0 +1,141 @@
++package model
++
++import (
++	"context"
++	"sync"
++)
++
++// StrictOrderRef identifies one strict policy token for request draining.
++// The key joins the id because test databases restart autoincrement ids
++// while production ids never repeat; admissions for distinct orders must
++// never share a gate.
++type StrictOrderRef struct {
++	ID  int
++	Key string
++}
++
++type strictTokenGate struct {
++	control  sync.Mutex
++	mu       sync.Mutex
++	cond     *sync.Cond
++	admitted int
++	draining bool
++}
++
++var strictTokenGates = struct {
++	sync.Mutex
++	entries map[StrictOrderRef]*strictTokenGate
++}{entries: make(map[StrictOrderRef]*strictTokenGate)}
++
++func strictTokenGateFor(ref StrictOrderRef) *strictTokenGate {
++	strictTokenGates.Lock()
++	defer strictTokenGates.Unlock()
++	gate, ok := strictTokenGates.entries[ref]
++	if !ok {
++		gate = &strictTokenGate{}
++		gate.cond = sync.NewCond(&gate.mu)
++		strictTokenGates.entries[ref] = gate
++	}
++	return gate
++}
++
++// StrictTokenAdmit records one admitted strict request. It reports false
++// while the order is draining, so no new request starts after disable.
++func StrictTokenAdmit(ref StrictOrderRef) bool {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	if gate.draining {
++		return false
++	}
++	gate.admitted++
++	return true
++}
++
++// StrictTokenRelease drops one admission. Every Admit caller must release
++// exactly once on every exit path, including settlement and failure.
++func StrictTokenRelease(ref StrictOrderRef) {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	if gate.admitted > 0 {
++		gate.admitted--
++	}
++	if gate.admitted == 0 {
++		gate.cond.Broadcast()
++	}
++}
++
++// StrictTokenAdmittedCount reports currently admitted strict requests.
++func StrictTokenAdmittedCount(ref StrictOrderRef) int {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	return gate.admitted
++}
++
++// StrictTokenBeginDisable starts rejecting new admissions. Callers must set
++// this before persisting the disabled status: admissions check the gate
++// after reading the row, so any admission that saw the old enabled status
++// either admitted before this call (and stays counted) or is rejected.
++func StrictTokenBeginDisable(ref StrictOrderRef) {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	gate.draining = true
++}
++
++// StrictTokenClearDisable reopens admissions after the token returns to
++// enabled. The persisted status remains the authority across restarts.
++func StrictTokenClearDisable(ref StrictOrderRef) {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	gate.draining = false
++	gate.cond.Broadcast()
++}
++
++// StrictTokenWaitDrained blocks until no admitted requests remain or ctx
++// ends. A cancelled wait leaves draining set: the order stays closed to
++// new admissions and the persisted disabled status is unchanged.
++func StrictTokenWaitDrained(ctx context.Context, ref StrictOrderRef) error {
++	gate := strictTokenGateFor(ref)
++	gate.mu.Lock()
++	defer gate.mu.Unlock()
++	if gate.admitted == 0 {
++		return nil
++	}
++	stop := context.AfterFunc(ctx, func() {
++		gate.mu.Lock()
++		defer gate.mu.Unlock()
++		gate.cond.Broadcast()
++	})
++	defer stop()
++	for gate.admitted > 0 {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		gate.cond.Wait()
++	}
++	return nil
++}
++
++// GetTokenForStrictOperation serializes the authoritative snapshot and admission
++// with status/model changes in this single New API process. Re-read AFTER the
++// lock: an initial lookup may have raced an entire disable/swap/enable cycle.
++// Callers release before serving inference; admitted counts cover that lifetime.
++func GetTokenForStrictOperation(id, userId int) (*Token, func(), error) {
++	token, err := GetTokenByIds(id, userId)
++	noop := func() {}
++	if err != nil || token.StrictTextPolicy == nil {
++		return token, noop, err
++	}
++	gate := strictTokenGateFor(StrictOrderRef{ID: token.Id, Key: token.Key})
++	gate.control.Lock()
++	token, err = GetTokenByIds(id, userId)
++	if err != nil {
++		gate.control.Unlock()
++		return nil, noop, err
++	}
++	return token, gate.control.Unlock, nil
++}
+diff --git a/model/strict_token_gate_test.go b/model/strict_token_gate_test.go
+new file mode 100644
+index 000000000..2a8e6f60b
+--- /dev/null
++++ b/model/strict_token_gate_test.go
+@@ -0,0 +1,75 @@
++package model
++
++import (
++	"context"
++	"fmt"
++	"sync/atomic"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++var strictGateTestSeq atomic.Int64
++
++func strictGateTestRef(t *testing.T) StrictOrderRef {
++	t.Helper()
++	return StrictOrderRef{ID: 1, Key: fmt.Sprintf("gate-test-%d", strictGateTestSeq.Add(1))}
++}
++
++func TestStrictTokenGateAdmitReleaseCount(t *testing.T) {
++	ref := strictGateTestRef(t)
++	require.True(t, StrictTokenAdmit(ref))
++	require.True(t, StrictTokenAdmit(ref))
++	assert.Equal(t, 2, StrictTokenAdmittedCount(ref))
++	StrictTokenRelease(ref)
++	assert.Equal(t, 1, StrictTokenAdmittedCount(ref))
++	StrictTokenRelease(ref)
++	assert.Equal(t, 0, StrictTokenAdmittedCount(ref))
++}
++
++func TestStrictTokenGateDrainRejectsNew(t *testing.T) {
++	ref := strictGateTestRef(t)
++	require.True(t, StrictTokenAdmit(ref))
++	StrictTokenBeginDisable(ref)
++	assert.False(t, StrictTokenAdmit(ref))
++	assert.Equal(t, 1, StrictTokenAdmittedCount(ref))
++	StrictTokenRelease(ref)
++	assert.Equal(t, 0, StrictTokenAdmittedCount(ref))
++	// Draining persists after the last release: the order stays closed.
++	assert.False(t, StrictTokenAdmit(ref))
++}
++
++func TestStrictTokenGateWaitDrainedReleases(t *testing.T) {
++	ref := strictGateTestRef(t)
++	require.True(t, StrictTokenAdmit(ref))
++	done := make(chan error, 1)
++	go func() {
++		done <- StrictTokenWaitDrained(context.Background(), ref)
++	}()
++	StrictTokenRelease(ref)
++	require.NoError(t, <-done)
++	assert.Equal(t, 0, StrictTokenAdmittedCount(ref))
++}
++
++func TestStrictTokenGateCancelledDrainStaysDraining(t *testing.T) {
++	ref := strictGateTestRef(t)
++	require.True(t, StrictTokenAdmit(ref))
++	StrictTokenBeginDisable(ref)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	require.ErrorIs(t, StrictTokenWaitDrained(ctx, ref), context.Canceled)
++	assert.False(t, StrictTokenAdmit(ref))
++	assert.Equal(t, 1, StrictTokenAdmittedCount(ref))
++	StrictTokenRelease(ref)
++}
++
++func TestStrictTokenGateClearDisableReopens(t *testing.T) {
++	ref := strictGateTestRef(t)
++	StrictTokenBeginDisable(ref)
++	assert.False(t, StrictTokenAdmit(ref))
++	StrictTokenClearDisable(ref)
++	require.True(t, StrictTokenAdmit(ref))
++	StrictTokenRelease(ref)
++	assert.Equal(t, 0, StrictTokenAdmittedCount(ref))
++}
+diff --git a/model/token.go b/model/token.go
+index bd2d5bf19..dd125d241 100644
+--- a/model/token.go
++++ b/model/token.go
+@@ -12,24 +12,44 @@ import (
+ )
+ 
+ type Token struct {
+-	Id                 int            `json:"id"`
+-	UserId             int            `json:"user_id" gorm:"index"`
+-	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+-	Status             int            `json:"status" gorm:"default:1"`
+-	Name               string         `json:"name" gorm:"index" `
+-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
+-	AccessedTime       int64          `json:"accessed_time" gorm:"bigint"`
+-	ExpiredTime        int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+-	RemainQuota        int            `json:"remain_quota" gorm:"default:0"`
+-	UnlimitedQuota     bool           `json:"unlimited_quota"`
+-	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
+-	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
+-	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
+-	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
+-	Group              string         `json:"group" gorm:"default:''"`
+-	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+-	AutoGroups         string         `json:"-" gorm:"type:text"`
+-	DeletedAt          gorm.DeletedAt `gorm:"index"`
++	Id                 int               `json:"id"`
++	UserId             int               `json:"user_id" gorm:"index"`
++	Key                string            `json:"key" gorm:"type:varchar(128);uniqueIndex"`
++	Status             int               `json:"status" gorm:"default:1"`
++	Name               string            `json:"name" gorm:"index" `
++	CreatedTime        int64             `json:"created_time" gorm:"bigint"`
++	AccessedTime       int64             `json:"accessed_time" gorm:"bigint"`
++	ExpiredTime        int64             `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
++	RemainQuota        int               `json:"remain_quota" gorm:"default:0"`
++	UnlimitedQuota     bool              `json:"unlimited_quota"`
++	ModelLimitsEnabled bool              `json:"model_limits_enabled"`
++	ModelLimits        string            `json:"model_limits" gorm:"type:text"`
++	AllowIps           *string           `json:"allow_ips" gorm:"default:''"`
++	UsedQuota          int               `json:"used_quota" gorm:"default:0"` // used quota
++	Group              string            `json:"group" gorm:"default:''"`
++	CrossGroupRetry    bool              `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
++	AutoGroups         string            `json:"-" gorm:"type:text"`
++	StrictTextPolicy   *StrictTextPolicy `json:"strict_text_policy,omitempty" gorm:"type:text"`
++	DeletedAt          gorm.DeletedAt    `gorm:"index"`
++}
++
++// ValidateStrictTextPolicy verifies the persisted policy a relay binding
++// consumes. Absent policy is not valid here; callers that accept legacy
++// tokens check for nil first and never reach this method with one.
++func (token *Token) ValidateStrictTextPolicy() error {
++	if token.StrictTextPolicy == nil {
++		return errors.New("strict text policy absent")
++	}
++	if token.UnlimitedQuota {
++		return errors.New("strict text policy requires finite quota")
++	}
++	if !token.ModelLimitsEnabled {
++		return errors.New("strict text policy requires model_limits_enabled")
++	}
++	if _, ok := StrictPolicySingleModel(token.ModelLimits); !ok {
++		return errors.New("strict text policy requires exactly one model")
++	}
++	return token.StrictTextPolicy.Validate()
+ }
+ 
+ func (token *Token) GetAutoGroups() ([]string, error) {
+@@ -301,11 +321,40 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+ }
+ 
+ func (token *Token) Insert() error {
++	if token.StrictTextPolicy != nil {
++		if err := token.ValidateStrictTextPolicy(); err != nil {
++			return err
++		}
++	}
+ 	var err error
+ 	err = DB.Create(token).Error
+ 	return err
+ }
+ 
++// CASStrictTextModel swaps the bound single model only while the stored model
++// still equals expectedModel. The write touches model_limits alone: quota,
++// usage, expiry, name, policy and key are never part of it. Legacy rows
++// without a policy never match.
++func CASStrictTextModel(id, userId int, key, expectedModel, newModel string) (bool, error) {
++	if _, ok := StrictPolicySingleModel(newModel); !ok {
++		return false, errors.New("strict text policy requires exactly one model")
++	}
++	if err := invalidateTokenCacheForMutation(key); err != nil {
++		return false, err
++	}
++	result := DB.Model(&Token{}).
++		Where("id = ? AND user_id = ? AND model_limits = ? AND strict_text_policy IS NOT NULL AND strict_text_policy != ''",
++			id, userId, expectedModel).
++		Updates(map[string]any{"model_limits": newModel})
++	if result.Error != nil {
++		return false, result.Error
++	}
++	if result.RowsAffected != 1 {
++		return false, nil
++	}
++	return true, nil
++}
++
+ // Update Make sure your token's fields is completed, because this will update non-zero values
+ func (token *Token) Update() (err error) {
+ 	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
+diff --git a/relay/common/relay_info.go b/relay/common/relay_info.go
+index 675815a7e..38e643740 100644
+--- a/relay/common/relay_info.go
++++ b/relay/common/relay_info.go
+@@ -136,7 +136,10 @@ type RelayInfo struct {
+ 	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
+ 	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
+ 	// 必须在提交前锁定全额。
+-	ForcePreConsume bool
++	ForcePreConsume      bool
++	StrictTextPolicyJSON []byte // Exact accepted policy snapshot for durable reservation.
++	StrictTextBilling    bool   // Pinned text requests reserve their complete upper bound.
++	StrictTextDispatched bool   // An uncertain upstream result must not refund delivered compute.
+ 	// Billing 是计费会话，封装了预扣费/结算/退款的统一生命周期。
+ 	// 初始免费组可为 nil；若 auto 重试切换到付费组，会在发送前创建。
+ 	Billing BillingSettler
+diff --git a/relay/compatible_handler.go b/relay/compatible_handler.go
+index c7fad1a08..2a9234a2b 100644
+--- a/relay/compatible_handler.go
++++ b/relay/compatible_handler.go
+@@ -1,6 +1,7 @@
+ package relay
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -9,6 +10,7 @@ import (
+ 	"github.com/QuantumNous/new-api/common"
+ 	"github.com/QuantumNous/new-api/constant"
+ 	"github.com/QuantumNous/new-api/logger"
++	"github.com/QuantumNous/new-api/model"
+ 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+ 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+ 	"github.com/QuantumNous/new-api/relay/helper"
+@@ -74,7 +76,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
+ 	adaptor.Init(info)
+ 
+ 	passThroughGlobal := model_setting.GetGlobalSettings().PassThroughRequestEnabled
+-	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
++	if !info.StrictTextBilling && info.RelayMode == relayconstant.RelayModeChatCompletions &&
+ 		!passThroughGlobal &&
+ 		!info.ChannelSetting.PassThroughBodyEnabled &&
+ 		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
+@@ -149,7 +151,24 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
+ 		requestBody = body
+ 	}
+ 
++	if info.StrictTextBilling {
++		data, err := io.ReadAll(requestBody)
++		if err != nil {
++			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
++		}
++		data, apiErr := prepareStrictTextDispatch(c, info, data)
++		if apiErr != nil {
++			return apiErr
++		}
++		requestBody = bytes.NewReader(data)
++	}
+ 	var httpResp *http.Response
++	if info.StrictTextBilling {
++		if _, err := model.MarkStrictTextReservationDispatched(info.RequestId); err != nil {
++			return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
++		}
++		info.StrictTextDispatched = true
++	}
+ 	resp, err := adaptor.DoRequest(c, info, requestBody)
+ 	if err != nil {
+ 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+diff --git a/relay/request_billing.go b/relay/request_billing.go
+index 4d7bd5d9f..7227a4846 100644
+--- a/relay/request_billing.go
++++ b/relay/request_billing.go
+@@ -4,10 +4,13 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"os"
+ 	"strings"
+ 
++	"github.com/QuantumNous/new-api/common"
+ 	"github.com/QuantumNous/new-api/constant"
+ 	"github.com/QuantumNous/new-api/logger"
++	"github.com/QuantumNous/new-api/model"
+ 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+ 	"github.com/QuantumNous/new-api/relay/helper"
+ 	"github.com/QuantumNous/new-api/relaykit/dto"
+@@ -49,6 +52,65 @@ func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.N
+ 		}
+ 	}
+ 
++	selected, outputLimit, reasoning := os.Getenv("PUNCH_STRICT_TEXT_MODEL"), 256, "low"
++	strict := selected != "" && info.OriginModelName == selected
++	var orderRef model.StrictOrderRef
++	orderBound := false
++	if info.TokenId > 0 {
++		token, unlock, err := model.GetTokenForStrictOperation(info.TokenId, info.UserId)
++		defer unlock()
++		if err != nil {
++			return types.NewErrorWithStatusCode(fmt.Errorf("strict order token unavailable"), types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++		}
++		if token.StrictTextPolicy != nil {
++			if err := token.ValidateStrictTextPolicy(); err != nil {
++				return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++			}
++			if info.OriginModelName != token.ModelLimits {
++				return types.NewErrorWithStatusCode(fmt.Errorf("requested model differs from order selection"), types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++			}
++			// Fresh row read: a request that passed auth before a
++			// status-only disable still stops here on the stored status.
++			if token.Status != common.TokenStatusEnabled {
++				return types.NewErrorWithStatusCode(fmt.Errorf("strict order token is not enabled"), types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++			}
++			binding := &strictOrderBinding{Model: token.ModelLimits, Policy: *token.StrictTextPolicy}
++			c.Set(strictOrderContextKey, binding)
++			selected, outputLimit, reasoning = binding.Model, binding.Policy.MaxOutputTokens, binding.Policy.ReasoningEffort
++			strict = true
++			orderRef = model.StrictOrderRef{ID: token.Id, Key: token.Key}
++			orderBound = true
++		}
++	}
++	if strict {
++
++		info.StrictTextBilling = true
++		info.ForcePreConsume = true
++		if c.Request.URL.Path != "/v1/chat/completions" {
++			return types.NewErrorWithStatusCode(fmt.Errorf("strict model supports text chat completions only"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
++		}
++		storage, err := common.GetBodyStorage(c)
++		if err != nil {
++			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
++		}
++		data, err := storage.Bytes()
++		if err == nil {
++			_, _, err = strictTextBodyWithLimits(data, selected, outputLimit, reasoning)
++		}
++		if err != nil {
++			return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
++		}
++		// Reserve after the final channel body is constructed, not this estimate.
++		if orderBound {
++			// Admit only after every strict check passed. The caller
++			// releases this admission when the request settles or fails.
++			if !model.StrictTokenAdmit(orderRef) {
++				return types.NewErrorWithStatusCode(fmt.Errorf("strict order is draining"), types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++			}
++			c.Set(strictOrderAdmissionKey, orderRef)
++		}
++		return nil
++	}
+ 	tokens, err := service.EstimateRequestToken(c, meta, info)
+ 	if err != nil {
+ 		return types.NewError(err, types.ErrorCodeCountTokenFailed)
+@@ -66,6 +128,25 @@ func PrepareRequestBilling(c *gin.Context, info *relaycommon.RelayInfo) *types.N
+ 	return service.PreConsumeBilling(c, priceData.QuotaToPreConsume, info)
+ }
+ 
++// strictOrderAdmissionKey marks a gin context that holds one strict-order
++// admission from PrepareRequestBilling. The relay defer releases it after
++// billing cleanup on every exit path.
++const strictOrderAdmissionKey = "punch.strict.admission"
++
++// ReleaseStrictOrderAdmission drops the strict-order admission recorded on
++// the context, if any. Requests without an order-bound strict admission are
++// unaffected.
++func ReleaseStrictOrderAdmission(c *gin.Context) {
++	value, exists := c.Get(strictOrderAdmissionKey)
++	if !exists {
++		return
++	}
++	delete(c.Keys, strictOrderAdmissionKey)
++	if ref, ok := value.(model.StrictOrderRef); ok {
++		model.StrictTokenRelease(ref)
++	}
++}
++
+ // RefundFailedRequestBilling applies the common final-failure policy after all
+ // eligible attempts have ended. A settled BillingSession never refunds again.
+ func RefundFailedRequestBilling(c *gin.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) *types.NewAPIError {
+diff --git a/relay/strict_text_billing.go b/relay/strict_text_billing.go
+new file mode 100644
+index 000000000..a1eafe25a
+--- /dev/null
++++ b/relay/strict_text_billing.go
+@@ -0,0 +1,233 @@
++package relay
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	"github.com/QuantumNous/new-api/constant"
++	"github.com/QuantumNous/new-api/model"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relay/helper"
++	"github.com/QuantumNous/new-api/relaykit/types"
++	"github.com/QuantumNous/new-api/service"
++	hosttypes "github.com/QuantumNous/new-api/types"
++	"github.com/gin-gonic/gin"
++	"github.com/shopspring/decimal"
++)
++
++const strictOrderContextKey = "punch.strict.order"
++
++type strictOrderBinding struct {
++	Model  string
++	Policy model.StrictTextPolicy
++}
++
++// This snapshot is captured before routing/reservation and is never refreshed
++// during a request. Model changes affect only subsequently admitted requests.
++func strictOrderFromContext(c *gin.Context) *strictOrderBinding {
++	value, exists := c.Get(strictOrderContextKey)
++	if !exists {
++		return nil
++	}
++	binding, _ := value.(*strictOrderBinding)
++	return binding
++}
++
++// This opt-in path is deliberately limited to the pinned text-only llama.cpp
++// channel. New API's native wallet/token reservations remain the sole ledger.
++func strictTextBody(data []byte, model string) ([]byte, int, error) {
++	return strictTextBodyWithLimits(data, model, 256, "low")
++}
++
++func strictTextBodyWithLimits(data []byte, model string, outputLimit int, reasoning string) ([]byte, int, error) {
++	var body map[string]any
++	if err := common.Unmarshal(data, &body); err != nil {
++		return nil, 0, err
++	}
++	allowed := map[string]bool{"model": true, "messages": true, "max_tokens": true, "max_completion_tokens": true, "n": true, "stream": true, "stream_options": true, "temperature": true, "top_p": true, "stop": true, "seed": true, "reasoning_effort": true}
++	for key := range body {
++		if !allowed[key] {
++			return nil, 0, fmt.Errorf("strict text mode does not support %s", key)
++		}
++	}
++	if body["model"] != model {
++		return nil, 0, fmt.Errorf("strict text model changed")
++	}
++	messages, ok := body["messages"].([]any)
++	if !ok || len(messages) == 0 {
++		return nil, 0, fmt.Errorf("strict text mode requires messages")
++	}
++	for _, v := range messages {
++		m, ok := v.(map[string]any)
++		if !ok {
++			return nil, 0, fmt.Errorf("invalid message")
++		}
++		for key := range m {
++			if key != "role" && key != "content" {
++				return nil, 0, fmt.Errorf("strict text message does not support %s", key)
++			}
++		}
++		if m["role"] != "system" && m["role"] != "user" && m["role"] != "assistant" {
++			return nil, 0, fmt.Errorf("unsupported text role")
++		}
++		if _, ok := m["content"].(string); !ok {
++			return nil, 0, fmt.Errorf("strict mode supports text content only")
++		}
++	}
++	if n, exists := body["n"]; exists && n != float64(1) {
++		return nil, 0, fmt.Errorf("strict mode requires n=1")
++	}
++	maximum := outputLimit
++	if v, exists := body["max_completion_tokens"]; exists {
++		f, ok := v.(float64)
++		if !ok || f < 1 || f > float64(outputLimit) || f != float64(int(f)) {
++			return nil, 0, fmt.Errorf("max_completion_tokens must be an integer from 1 to %d", outputLimit)
++		}
++		maximum = int(f)
++	}
++	if v, exists := body["max_tokens"]; exists {
++		f, ok := v.(float64)
++		if !ok || f < 1 || f > float64(outputLimit) || f != float64(int(f)) {
++			return nil, 0, fmt.Errorf("max_tokens must be an integer from 1 to %d", outputLimit)
++		}
++		if other, exists := body["max_completion_tokens"]; exists && other != v {
++			return nil, 0, fmt.Errorf("conflicting output limits")
++		}
++		maximum = int(f)
++	}
++	if value, exists := body["reasoning_effort"]; exists && value != reasoning {
++		return nil, 0, fmt.Errorf("reasoning effort differs from the accepted model profile")
++	}
++	if reasoning == "" {
++		delete(body, "reasoning_effort")
++	} else {
++		body["reasoning_effort"] = reasoning
++	}
++	body["max_tokens"] = maximum
++	delete(body, "max_completion_tokens")
++	body["n"] = 1
++	encoded, err := common.Marshal(body)
++	return encoded, maximum, err
++}
++
++func strictBackendJSON(ctx context.Context, base, path string, body any, out any) error {
++	data, err := common.Marshal(body)
++	if err != nil {
++		return err
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(data))
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	client := http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return fmt.Errorf("strict tokenizer redirect refused") }}
++	res, err := client.Do(req)
++	if err != nil {
++		return fmt.Errorf("strict tokenizer unavailable")
++	}
++	defer res.Body.Close()
++	if res.StatusCode != http.StatusOK {
++		return fmt.Errorf("strict tokenizer returned HTTP %d", res.StatusCode)
++	}
++	data, err = io.ReadAll(io.LimitReader(res.Body, 8*1024*1024))
++	if err != nil {
++		return err
++	}
++	return common.Unmarshal(data, out)
++}
++
++func prepareStrictTextDispatch(c *gin.Context, info *relaycommon.RelayInfo, data []byte) ([]byte, *types.NewAPIError) {
++	invalid := func(err error) ([]byte, *types.NewAPIError) {
++		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
++	}
++	base := os.Getenv("PUNCH_STRICT_TEXT_BASE_URL")
++	if base == "" || info.ChannelBaseUrl != base || info.Billing != nil {
++		return invalid(fmt.Errorf("strict text channel or billing session changed"))
++	}
++	selected, outputLimit, contextLimit, reasoning := os.Getenv("PUNCH_STRICT_TEXT_MODEL"), 256, 4096, "low"
++	binding := strictOrderFromContext(c)
++	if binding != nil {
++		selected = binding.Model
++		outputLimit, contextLimit, reasoning = binding.Policy.MaxOutputTokens, binding.Policy.ContextTokens, binding.Policy.ReasoningEffort
++		if info.OriginModelName != selected || info.IsModelMapped {
++			return invalid(fmt.Errorf("strict order model routing changed"))
++		}
++	}
++	data, maximum, err := strictTextBodyWithLimits(data, selected, outputLimit, reasoning)
++	if err != nil {
++		return invalid(err)
++	}
++	var body map[string]any
++	if err = common.Unmarshal(data, &body); err != nil {
++		return invalid(err)
++	}
++	var formatted struct {
++		Prompt string `json:"prompt"`
++	}
++	if err = strictBackendJSON(c.Request.Context(), base, "/apply-template", body, &formatted); err != nil {
++		return invalid(err)
++	}
++	var tokenized struct {
++		Tokens []int `json:"tokens"`
++	}
++	if err = strictBackendJSON(c.Request.Context(), base, "/tokenize", map[string]any{"model": body["model"], "content": formatted.Prompt, "add_special": true, "parse_special": true}, &tokenized); err != nil {
++		return invalid(err)
++	}
++	prompt := len(tokenized.Tokens)
++	if prompt < 1 || prompt > contextLimit-maximum {
++		return invalid(fmt.Errorf("strict text request exceeds the %d-token context", contextLimit))
++	}
++	info.SetEstimatePromptTokens(prompt)
++	common.SetContextKey(c, constant.ContextKeyPromptTokens, prompt)
++	var quota int
++	if binding != nil {
++		p := binding.Policy
++		// Snapshot directly into the existing settlement price structure. No global
++		// model-rate mutation and no secondary balance/accounting store.
++		info.PriceData = hosttypes.PriceData{
++			ModelRatio: p.InputRate, CompletionRatio: p.OutputRate / p.InputRate,
++			CacheRatio:     p.CacheRate / p.InputRate,
++			GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
++		}
++		info.BillingModelName = info.OriginModelName
++		info.TieredBillingSnapshot = nil
++		upper := decimal.NewFromInt(int64(prompt)).Mul(decimal.NewFromFloat(p.InputRate)).Add(
++			decimal.NewFromInt(int64(maximum)).Mul(decimal.NewFromFloat(p.OutputRate)))
++		quota, err = common.QuotaFromDecimalStrict(upper.Ceil())
++	} else {
++		price, priceErr := helper.ModelPriceHelper(c, info, prompt, &types.TokenCountMeta{MaxTokens: maximum})
++		if priceErr != nil {
++			return invalid(priceErr)
++		}
++		// Retained single-model prototype keeps its accepted 1/5/1 pricing.
++		if price.UsePrice || price.FreeModel || info.TieredBillingSnapshot != nil || price.ModelRatio != 1 || price.CompletionRatio != 5 || price.CacheRatio != 1 || price.GroupRatioInfo.GroupRatio != 1 {
++			return invalid(fmt.Errorf("strict fixture pricing differs from accepted input1/output5/cache1 rates"))
++		}
++		quota, err = common.QuotaFromFloatStrict(float64(prompt) + 5*float64(maximum))
++	}
++	if err != nil {
++		return invalid(err)
++	}
++	policy := model.StrictTextPolicy{InputRate: 1, OutputRate: 5, CacheRate: 1,
++		ContextTokens: contextLimit, MaxOutputTokens: outputLimit, ReasoningEffort: reasoning}
++	if binding != nil {
++		policy = binding.Policy
++	}
++	info.StrictTextPolicyJSON, err = common.Marshal(policy)
++	if err != nil {
++		return invalid(err)
++	}
++	info.PriceData.QuotaToPreConsume = quota
++	info.ForcePreConsume = true
++	info.UserSetting.BillingPreference = "wallet_only"
++	if apiErr := service.PreConsumeBilling(c, quota, info); apiErr != nil {
++		return nil, apiErr
++	}
++	return data, nil
++}
+diff --git a/relay/strict_text_billing_test.go b/relay/strict_text_billing_test.go
+new file mode 100644
+index 000000000..af3a137a0
+--- /dev/null
++++ b/relay/strict_text_billing_test.go
+@@ -0,0 +1,375 @@
++package relay
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"github.com/QuantumNous/new-api/model"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/QuantumNous/new-api/service"
++	"gorm.io/gorm"
++	"net/http"
++	"net/http/httptest"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/QuantumNous/new-api/common"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/bytedance/gopkg/util/gopool"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++// The pinned llama.cpp router's proxy_post reads body.model for BOTH routes
++// and rejects an absent model (server-models.cpp:1849,1962 at 391fac164).
++// Exercise the actual dispatch preparation through its HTTP boundary; an
++// over-context response stops before any reservation or inference is possible.
++func TestStrictTextTokenizerUsesSelectedModel(t *testing.T) {
++	for _, selected := range []string{"model-revision-a", "model-revision-b"} {
++		t.Run(selected, func(t *testing.T) {
++			var templateModel, tokenizerModel string
++			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				var body map[string]any
++				if json.NewDecoder(r.Body).Decode(&body) != nil {
++					w.WriteHeader(http.StatusBadRequest)
++					return
++				}
++				name, _ := body["model"].(string)
++				switch r.URL.Path {
++				case "/apply-template":
++					templateModel = name
++					_ = json.NewEncoder(w).Encode(map[string]any{"prompt": "rendered:" + name})
++				case "/tokenize":
++					tokenizerModel = name
++					if name == "" {
++						http.Error(w, "model name is missing from the request", http.StatusBadRequest)
++						return
++					}
++					_ = json.NewEncoder(w).Encode(map[string]any{"tokens": make([]int, 4097)})
++				default:
++					w.WriteHeader(http.StatusNotFound)
++				}
++			}))
++			defer backend.Close()
++			t.Setenv("PUNCH_STRICT_TEXT_BASE_URL", backend.URL)
++			t.Setenv("PUNCH_STRICT_TEXT_MODEL", selected)
++			c, _ := gin.CreateTestContext(httptest.NewRecorder())
++			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
++			info := &relaycommon.RelayInfo{UserSetting: dto.UserSetting{QuotaWarningThreshold: -1000000}, ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: backend.URL}}
++			data := []byte(`{"model":"` + selected + `","messages":[{"role":"user","content":"hello"}],"max_tokens":1}`)
++			_, apiErr := prepareStrictTextDispatch(c, info, data)
++			require.Error(t, apiErr)
++			assert.Equal(t, selected, templateModel)
++			assert.Equal(t, templateModel, tokenizerModel)
++			assert.True(t, strings.Contains(apiErr.Error(), "4096-token context"), apiErr.Error())
++			assert.Nil(t, info.Billing)
++		})
++	}
++}
++
++func TestStrictTextRequestBounds(t *testing.T) {
++	for _, tc := range []struct {
++		name, extra string
++		maximum     int
++		reject      bool
++	}{
++		{"default", "", 256, false}, {"small", `,"max_tokens":8`, 8, false}, {"completion", `,"max_completion_tokens":32`, 32, false},
++		{"negative", `,"max_tokens":-1`, 0, true}, {"zero", `,"max_tokens":0`, 0, true}, {"huge", `,"max_tokens":18446744073709551615`, 0, true},
++		{"conflict", `,"max_tokens":8,"max_completion_tokens":9`, 0, true}, {"override", `,"max_tokens":1,"n_predict":256`, 0, true},
++		{"multiple", `,"n":2`, 0, true}, {"tool", `,"tools":[]`, 0, true}, {"template", `,"chat_template_kwargs":{}`, 0, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			body := []byte(`{"model":"punch-test-model","messages":[{"role":"user","content":"Hello"}]` + tc.extra + `}`)
++			out, max, err := strictTextBody(body, "punch-test-model")
++			if tc.reject {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			assert.Equal(t, tc.maximum, max)
++			var v map[string]any
++			require.NoError(t, common.Unmarshal(out, &v))
++			assert.Equal(t, float64(tc.maximum), v["max_tokens"])
++			assert.NotContains(t, v, "max_completion_tokens")
++			assert.Equal(t, float64(1), v["n"])
++		})
++	}
++}
++
++func TestStrictTextRejectsNonTextAndForeignModel(t *testing.T) {
++	for _, body := range []string{
++		`{"model":"other","messages":[{"role":"user","content":"x"}]}`,
++		`{"model":"punch-test-model","messages":[{"role":"user","content":[{"type":"image_url"}]}]}`,
++		`{"model":"punch-test-model","messages":[{"role":"tool","content":"x"}]}`,
++		`{"model":"punch-test-model","messages":[{"role":"assistant","content":"x","tool_calls":[]}]}`,
++	} {
++		_, _, err := strictTextBody([]byte(body), "punch-test-model")
++		require.Error(t, err)
++	}
++}
++
++func TestStrictTextConfiguredOutputAndReasoning(t *testing.T) {
++	data := []byte(`{"model":"plain-model","messages":[{"role":"user","content":"hello"}]}`)
++	encoded, maximum, err := strictTextBodyWithLimits(data, "plain-model", 16, "")
++	require.NoError(t, err)
++	require.Equal(t, 16, maximum)
++	var body map[string]any
++	require.NoError(t, common.Unmarshal(encoded, &body))
++	require.NotContains(t, body, "reasoning_effort")
++	body["max_tokens"] = 17
++	invalid, err := common.Marshal(body)
++	require.NoError(t, err)
++	_, _, err = strictTextBodyWithLimits(invalid, "plain-model", 16, "")
++	require.ErrorContains(t, err, "1 to 16")
++	body["max_tokens"] = 8
++	body["reasoning_effort"] = "high"
++	invalid, err = common.Marshal(body)
++	require.NoError(t, err)
++	_, _, err = strictTextBodyWithLimits(invalid, "plain-model", 16, "")
++	require.ErrorContains(t, err, "accepted model profile")
++}
++
++// Use the real DB initializer so native quota-denial readbacks use the
++// same dialect metadata as the running gateway, with only owned temp data.
++func setupStrictOrderDB(t *testing.T) *gorm.DB {
++	t.Helper()
++	oldDB, oldPath, oldMaster := model.DB, common.SQLitePath, common.IsMasterNode
++	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
++	common.SQLitePath, common.IsMasterNode = filepath.Join(t.TempDir(), "orders.db"), false
++	t.Setenv("SQL_DSN", "local")
++	t.Setenv("LOG_SQL_DSN", "")
++	require.NoError(t, model.InitDB())
++	db := model.DB
++	sqlDB, err := db.DB()
++	require.NoError(t, err)
++	sqlDB.SetMaxOpenConns(1)
++	t.Cleanup(func() {
++		require.NoError(t, sqlDB.Close())
++		model.DB, common.SQLitePath, common.IsMasterNode = oldDB, oldPath, oldMaster
++		common.SetDatabaseTypes(oldMain, oldLog)
++	})
++	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.StrictTextReservation{}))
++	return db
++}
++
++// Real request admission, HTTP template/tokenizer calls and native SQLite
++// reservation/settlement. Only the generator response is a synthetic fixture.
++func TestStrictOrderRatesUseNativeLedger(t *testing.T) {
++	db := setupStrictOrderDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Log{}))
++	oldLog, oldRedis, oldBatch := model.LOG_DB, common.RedisEnabled, common.BatchUpdateEnabled
++	model.LOG_DB, common.RedisEnabled, common.BatchUpdateEnabled = db, false, false
++	t.Cleanup(func() { model.LOG_DB, common.RedisEnabled, common.BatchUpdateEnabled = oldLog, oldRedis, oldBatch })
++	waitStrictFixtureTasks(t)
++	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		if json.NewDecoder(r.Body).Decode(&body) != nil || body["model"] != "revision-b" {
++			w.WriteHeader(400)
++			return
++		}
++		if r.URL.Path == "/apply-template" {
++			_ = json.NewEncoder(w).Encode(map[string]any{"prompt": "rendered-b"})
++			return
++		}
++		if r.URL.Path == "/tokenize" && body["content"] == "rendered-b" {
++			_ = json.NewEncoder(w).Encode(map[string]any{"tokens": []int{10, 11, 12, 13}})
++			return
++		}
++		w.WriteHeader(404)
++	}))
++	defer backend.Close()
++	t.Setenv("PUNCH_STRICT_TEXT_BASE_URL", backend.URL)
++	t.Setenv("PUNCH_STRICT_TEXT_MODEL", "legacy-model")
++	for index, rates := range []struct {
++		input, output   float64
++		reserve, charge int
++	}{{1, 5, 34, 14}, {2, 3, 26, 14}, {0.25, 0.5, 4, 2}} {
++		user := &model.User{Username: fmt.Sprintf("order-user-%d", index), AffCode: fmt.Sprintf("order-aff-%d", index), Quota: 100}
++		require.NoError(t, db.Create(user).Error)
++		token := &model.Token{UserId: user.Id, Key: fmt.Sprintf("synthetic-order-key-%d", index), Name: fmt.Sprintf("order-%d", index), RemainQuota: 100, ModelLimitsEnabled: true, ModelLimits: "revision-b", ExpiredTime: time.Now().Add(time.Hour).Unix(), StrictTextPolicy: &model.StrictTextPolicy{InputRate: rates.input, OutputRate: rates.output, CacheRate: rates.input, ContextTokens: 64, MaxOutputTokens: 6}}
++		require.NoError(t, token.Insert())
++		data := []byte(`{"model":"revision-b","messages":[{"role":"user","content":"hello"}],"max_tokens":6}`)
++		c, _ := gin.CreateTestContext(httptest.NewRecorder())
++		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(data))
++		defer common.CleanupBodyStorage(c)
++		info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "revision-b", StartTime: time.Now(), UserSetting: dto.UserSetting{QuotaWarningThreshold: -1000000}, ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: backend.URL}}
++		require.Nil(t, PrepareRequestBilling(c, info))
++		require.True(t, info.StrictTextBilling)
++		_, apiErr := prepareStrictTextDispatch(c, info, data)
++		require.Nil(t, apiErr)
++		require.Equal(t, rates.reserve, info.Billing.GetPreConsumedQuota())
++		info.StrictTextDispatched = true
++		service.PostTextConsumeQuota(c, info, &dto.Usage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}, nil)
++		persisted, err := model.GetTokenByIds(token.Id, user.Id)
++		require.NoError(t, err)
++		require.Equal(t, 100-rates.charge, persisted.RemainQuota)
++		require.Equal(t, token.Key, persisted.Key)
++		require.Equal(t, token.ExpiredTime, persisted.ExpiredTime)
++		require.Equal(t, token.StrictTextPolicy, persisted.StrictTextPolicy)
++		var got model.User
++		require.NoError(t, db.First(&got, user.Id).Error)
++		require.Equal(t, persisted.RemainQuota, got.Quota)
++	}
++}
++
++func TestStrictOrderConcurrentReservationsStayCapped(t *testing.T) {
++	db := setupStrictOrderDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
++	oldRedis, oldBatch := common.RedisEnabled, common.BatchUpdateEnabled
++	common.RedisEnabled, common.BatchUpdateEnabled = false, false
++	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldBatch })
++	waitStrictFixtureTasks(t)
++	user := &model.User{Username: "concurrent-order", Quota: 100}
++	require.NoError(t, db.Create(user).Error)
++	token := &model.Token{UserId: user.Id, Key: "synthetic-concurrency-key", RemainQuota: 100}
++	require.NoError(t, db.Create(token).Error)
++	var wg sync.WaitGroup
++	admitted := make(chan *service.BillingSession, 8)
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			c, _ := gin.CreateTestContext(httptest.NewRecorder())
++			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "punch-test-model", StrictTextBilling: true, ForcePreConsume: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
++			session, err := service.NewBillingSession(c, info, 80)
++			if err == nil {
++				admitted <- session
++			}
++		}()
++	}
++	wg.Wait()
++	close(admitted)
++	require.Len(t, admitted, 1)
++	for session := range admitted {
++		require.NoError(t, session.Settle(60))
++	}
++	persisted, err := model.GetTokenByIds(token.Id, user.Id)
++	require.NoError(t, err)
++	require.Equal(t, 40, persisted.RemainQuota)
++	var got model.User
++	require.NoError(t, db.First(&got, user.Id).Error)
++	require.Equal(t, 40, got.Quota)
++}
++
++// A strict order token disabled in the database must be rejected at admission,
++// even for a request that authenticated before the disable (stale auth): the
++// admission path re-reads the row instead of trusting earlier auth.
++func TestStrictOrderDisabledTokenRejectedAtAdmission(t *testing.T) {
++	db := setupStrictOrderDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
++	oldRedis, oldBatch := common.RedisEnabled, common.BatchUpdateEnabled
++	common.RedisEnabled, common.BatchUpdateEnabled = false, false
++	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldBatch })
++	waitStrictFixtureTasks(t)
++	user := &model.User{Username: "disabled-order-user", Quota: 100}
++	require.NoError(t, db.Create(user).Error)
++	token := &model.Token{UserId: user.Id, Key: "synthetic-disabled-key", Name: "disabled-order",
++		Status: common.TokenStatusDisabled, RemainQuota: 100,
++		ModelLimitsEnabled: true, ModelLimits: "revision-b", ExpiredTime: -1,
++		StrictTextPolicy: &model.StrictTextPolicy{InputRate: 1, OutputRate: 5, CacheRate: 1, ContextTokens: 64, MaxOutputTokens: 6}}
++	require.NoError(t, token.Insert())
++	data := []byte(`{"model":"revision-b","messages":[{"role":"user","content":"hello"}],"max_tokens":6}`)
++	c, _ := gin.CreateTestContext(httptest.NewRecorder())
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(data))
++	defer common.CleanupBodyStorage(c)
++	info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "revision-b", StartTime: time.Now()}
++	apiErr := PrepareRequestBilling(c, info)
++	require.NotNil(t, apiErr)
++	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
++}
++
++// Admission, release and drain denial through the real PrepareRequestBilling
++// path: a valid order-bound request holds one admission the relay defer
++// releases, and the same request is denied while the order drains.
++func TestStrictOrderAdmissionLifecycle(t *testing.T) {
++	db := setupStrictOrderDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
++	oldRedis, oldBatch := common.RedisEnabled, common.BatchUpdateEnabled
++	common.RedisEnabled, common.BatchUpdateEnabled = false, false
++	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = oldRedis, oldBatch })
++	waitStrictFixtureTasks(t)
++	user := &model.User{Username: "admission-order-user", Quota: 100}
++	require.NoError(t, db.Create(user).Error)
++	token := &model.Token{UserId: user.Id, Key: "synthetic-admission-key", Name: "admission-order",
++		Status: common.TokenStatusEnabled, RemainQuota: 100,
++		ModelLimitsEnabled: true, ModelLimits: "revision-b", ExpiredTime: -1,
++		StrictTextPolicy: &model.StrictTextPolicy{InputRate: 1, OutputRate: 5, CacheRate: 1, ContextTokens: 64, MaxOutputTokens: 6}}
++	require.NoError(t, token.Insert())
++	ref := model.StrictOrderRef{ID: token.Id, Key: token.Key}
++	c, info := newStrictAdmissionContext(t, user, token)
++	require.Nil(t, PrepareRequestBilling(c, info))
++	assert.Equal(t, 1, model.StrictTokenAdmittedCount(ref))
++	ReleaseStrictOrderAdmission(c)
++	assert.Equal(t, 0, model.StrictTokenAdmittedCount(ref))
++	// Repeat release is a no-op: no negative counts, no panic.
++	ReleaseStrictOrderAdmission(c)
++	assert.Equal(t, 0, model.StrictTokenAdmittedCount(ref))
++
++	// While draining, the same valid request is denied without admission.
++	model.StrictTokenBeginDisable(ref)
++	c2, info2 := newStrictAdmissionContext(t, user, token)
++	apiErr := PrepareRequestBilling(c2, info2)
++	require.NotNil(t, apiErr)
++	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
++	assert.Equal(t, 0, model.StrictTokenAdmittedCount(ref))
++	model.StrictTokenClearDisable(ref)
++}
++
++func newStrictAdmissionContext(t *testing.T, user *model.User, token *model.Token) (*gin.Context, *relaycommon.RelayInfo) {
++	t.Helper()
++	data := []byte(`{"model":"revision-b","messages":[{"role":"user","content":"hello"}],"max_tokens":6}`)
++	c, _ := gin.CreateTestContext(httptest.NewRecorder())
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(data))
++	t.Cleanup(func() { common.CleanupBodyStorage(c) })
++	info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "revision-b", StartTime: time.Now()}
++	return c, info
++}
++
++// A request can read the old selection just before disable/swap/enable.
++// Exercise that exact stale DB snapshot through GORM's actual query callback.
++func TestStrictOrderStaleReadAcrossModelSwitch(t *testing.T) {
++	db := setupStrictOrderDB(t)
++	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
++	oldRedis := common.RedisEnabled
++	common.RedisEnabled = false
++	t.Cleanup(func() { common.RedisEnabled = oldRedis })
++	user := &model.User{Username: "stale-model-user", Quota: 100}
++	require.NoError(t, db.Create(user).Error)
++	token := &model.Token{UserId: user.Id, Key: "synthetic-stale-selection", Status: common.TokenStatusEnabled, RemainQuota: 100, ModelLimitsEnabled: true, ModelLimits: "revision-b", ExpiredTime: -1, StrictTextPolicy: &model.StrictTextPolicy{InputRate: 1, OutputRate: 5, CacheRate: 1, ContextTokens: 64, MaxOutputTokens: 6}}
++	require.NoError(t, token.Insert())
++	captured, proceed := make(chan struct{}), make(chan struct{})
++	var first atomic.Bool
++	require.NoError(t, db.Callback().Query().After("gorm:query").Register("punch-stale-snapshot", func(tx *gorm.DB) {
++		if tx.Statement.Table == "tokens" && first.CompareAndSwap(false, true) {
++			close(captured)
++			<-proceed
++		}
++	}))
++	t.Cleanup(func() { db.Callback().Query().Remove("punch-stale-snapshot") })
++	c, info := newStrictAdmissionContext(t, user, token)
++	result := make(chan bool, 1)
++	go func() { err := PrepareRequestBilling(c, info); ReleaseStrictOrderAdmission(c); result <- err != nil }()
++	<-captured
++	ref := model.StrictOrderRef{ID: token.Id, Key: token.Key}
++	model.StrictTokenBeginDisable(ref)
++	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{"status": common.TokenStatusDisabled, "model_limits": "revision-c"}).Error)
++	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", token.Id).Update("status", common.TokenStatusEnabled).Error)
++	model.StrictTokenClearDisable(ref)
++	close(proceed)
++	require.True(t, <-result, "stale selection admitted after model switch")
++}
++
++// Native settlement schedules cache/notification callbacks. Join them before
++// restoring fixture DB/config; otherwise a passing assertion can race teardown.
++func waitStrictFixtureTasks(t *testing.T) {
++	t.Helper()
++	baseline := gopool.WorkerCount()
++	t.Cleanup(func() {
++		require.Eventually(t, func() bool { return gopool.WorkerCount() <= baseline }, 5*time.Second, time.Millisecond, "native fixture callbacks did not finish")
++	})
++}
+diff --git a/service/billing_session.go b/service/billing_session.go
+index 6ff872dc8..317f10b89 100644
+--- a/service/billing_session.go
++++ b/service/billing_session.go
+@@ -25,6 +25,8 @@ import (
+ // BillingSession 封装单次请求的预扣费/结算/退款生命周期。
+ // 实现 relaycommon.BillingSettler 接口。
+ type BillingSession struct {
++	durableRequestId string
++	statsCommitted   bool // durable strict settle wrote usage statistics in its own commit
+ 	relayInfo        *relaycommon.RelayInfo
+ 	funding          FundingSource
+ 	preConsumedQuota int  // 实际预扣额度（信任用户可能为 0）
+@@ -46,6 +48,16 @@ func (s *BillingSession) Settle(actualQuota int) error {
+ 	if s.settled {
+ 		return nil
+ 	}
++	if s.relayInfo.StrictTextBilling && (actualQuota < 0 || actualQuota > s.preConsumedQuota) {
++		return fmt.Errorf("strict text usage exceeds reserved quota; reservation retained")
++	}
++	if s.durableRequestId != "" {
++		if _, err := model.SettleStrictTextReservation(s.durableRequestId, actualQuota); err != nil {
++			return err
++		}
++		s.fundingSettled, s.settled, s.statsCommitted = true, true, true
++		return nil
++	}
+ 	delta := actualQuota - s.preConsumedQuota
+ 	if delta == 0 {
+ 		s.settled = true
+@@ -80,14 +92,44 @@ func (s *BillingSession) Settle(actualQuota int) error {
+ 	return tokenErr
+ }
+ 
+-// Refund 退还所有预扣费，幂等安全，异步执行。
++// StrictStatsCommitted reports whether the durable strict settlement already
++// committed usage statistics in its own transaction. Callers that settle
++// through this session must then skip the legacy separate statistics writes,
++// which would otherwise run ahead of (and double) the committed settlement.
++func (s *BillingSession) StrictStatsCommitted() bool {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.statsCommitted
++}
++
++// Refund 退还所有预扣费，幂等安全，默认异步执行。
++// Strict text 请求若尚未 dispatch，则同步完成退款后才返回，保证调用者在
++// Refund 返回时即可复用额度；其他请求保持异步行为，dispatched 但结果不确定
++// 的预留仍按原逻辑保留。
+ func (s *BillingSession) Refund(c *gin.Context) {
+ 	s.mu.Lock()
++	if s.relayInfo.StrictTextBilling && s.relayInfo.StrictTextDispatched && !s.settled {
++		s.mu.Unlock()
++		logger.LogWarn(c, "strict text result uncertain; bounded reservation retained, no automatic retry/refund")
++		return
++	}
+ 	if s.settled || s.refunded || !s.needsRefundLocked() {
+ 		s.mu.Unlock()
+ 		return
+ 	}
++	if s.durableRequestId != "" {
++		_, err := model.RefundStrictTextReservation(s.durableRequestId)
++		if err == nil {
++			s.refunded = true
++		}
++		s.mu.Unlock()
++		if err != nil {
++			logger.LogWarn(c, "strict refund pending: "+err.Error())
++		}
++		return
++	}
+ 	s.refunded = true
++	syncRefund := s.relayInfo.StrictTextBilling && !s.relayInfo.StrictTextDispatched
+ 	s.mu.Unlock()
+ 
+ 	logger.LogInfo(c, fmt.Sprintf("用户 %d 请求失败, 返还预扣费（token_quota=%s, funding=%s）",
+@@ -105,7 +147,7 @@ func (s *BillingSession) Refund(c *gin.Context) {
+ 	subscriptionId := s.relayInfo.SubscriptionId
+ 	funding := s.funding
+ 
+-	gopool.Go(func() {
++	doRefund := func() {
+ 		// 1) 退还资金来源
+ 		if err := funding.Refund(); err != nil {
+ 			common.SysLog("error refunding billing source: " + err.Error())
+@@ -121,7 +163,12 @@ func (s *BillingSession) Refund(c *gin.Context) {
+ 				common.SysLog("error refunding token quota: " + err.Error())
+ 			}
+ 		}
+-	})
++	}
++	if syncRefund {
++		doRefund()
++		return
++	}
++	gopool.Go(doRefund)
+ }
+ 
+ // NeedsRefund 返回是否存在需要退还的预扣状态。
+@@ -164,6 +211,9 @@ func (s *BillingSession) Reserve(targetQuota int) error {
+ 		return nil
+ 	}
+ 
++	if s.durableRequestId != "" {
++		return fmt.Errorf("strict reservation upper bound is immutable")
++	}
+ 	delta := targetQuota - s.preConsumedQuota
+ 	if delta <= 0 {
+ 		return nil
+@@ -194,6 +244,38 @@ func (s *BillingSession) Reserve(targetQuota int) error {
+ // preConsume 执行预扣费：信任检查 -> 令牌预扣 -> 资金来源预扣。
+ // 任一步骤失败时原子回滚已完成的步骤。
+ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIError {
++	if s.relayInfo.StrictTextBilling {
++		if s.funding.Source() != BillingSourceWallet || s.relayInfo.IsPlayground {
++			return types.NewError(fmt.Errorf("strict text requires an order wallet"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
++		}
++		info := s.relayInfo
++		if info.RequestId == "" {
++			info.RequestId = common.NewRequestId()
++		}
++		policy := model.StrictTextPolicy{InputRate: 1, OutputRate: 5, CacheRate: 1,
++			ContextTokens: 4096, MaxOutputTokens: 256, ReasoningEffort: "low"}
++		if len(info.StrictTextPolicyJSON) > 0 {
++			policy = model.StrictTextPolicy{}
++			if err := common.Unmarshal(info.StrictTextPolicyJSON, &policy); err != nil {
++				return types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
++			}
++		}
++		channelID := 0
++		if info.ChannelMeta != nil {
++			channelID = info.ChannelId
++		}
++		_, err := model.ReserveStrictTextWalletReservation(model.StrictReservationInput{
++			RequestId: info.RequestId, UserId: info.UserId, TokenId: info.TokenId,
++			TokenKey: info.TokenKey, ChannelId: channelID, Model: info.OriginModelName,
++			Policy: policy, ReservedQuota: quota,
++		})
++		if err != nil {
++			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry())
++		}
++		s.durableRequestId, s.preConsumedQuota, s.tokenConsumed = info.RequestId, quota, quota
++		s.syncRelayInfo()
++		return nil
++	}
+ 	effectiveQuota := quota
+ 
+ 	// ---- 信任额度旁路 ----
+diff --git a/service/strict_text_billing_test.go b/service/strict_text_billing_test.go
+new file mode 100644
+index 000000000..da7d571ff
+--- /dev/null
++++ b/service/strict_text_billing_test.go
+@@ -0,0 +1,342 @@
++package service
++
++// Strict text billing regression tests (opt-in per-order cap).
++//
++// Contract under test (see relay/request_billing.go opt-in,
++// service/billing_session.go Settle gate):
++//  1. ForcePreConsume disables the trust bypass even when balances sit
++//     above the trust threshold.
++//  2. On a strict session, Settle(actual > reserved) fails and preserves
++//     the reservation (no debit, session left unsettled for Refund).
++//  3. A successful strict Settle refunds the unused part exactly once;
++//     a later Refund is a no-op and cannot double refund.
++//  4. The normal (non-strict) Settle path still debits over-reservation
++//     actuals (documents the unchanged seam, not the desired cap).
++//  5. A dispatched strict request with no valid settlement keeps its
++//     reservation on Refund (uncertain inference is not a free retry).
++//
++// Reuses the service-package test DB fixtures (seedUser/seedToken/truncate
++// in task_billing_test.go) and real model quota functions; no mocks.
++
++import (
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/QuantumNous/new-api/model"
++	relaycommon "github.com/QuantumNous/new-api/relay/common"
++	"github.com/QuantumNous/new-api/relaykit/dto"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func strictTestContext() *gin.Context {
++	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
++	return ctx
++}
++
++func strictRelayInfo(userID, tokenID int, tokenKey string) *relaycommon.RelayInfo {
++	return &relaycommon.RelayInfo{
++		OriginModelName: "punch-test-model",
++		ChannelMeta:     &relaycommon.ChannelMeta{},
++		UserId:          userID,
++		TokenId:         tokenID,
++		TokenKey:        tokenKey,
++		UserSetting:     dto.UserSetting{BillingPreference: "wallet_only"},
++	}
++}
++
++func userQuotaNow(t *testing.T, userID int) int {
++	t.Helper()
++	q, err := model.GetUserQuota(userID, false)
++	require.NoError(t, err)
++	return q
++}
++
++func tokenRemainNow(t *testing.T, tokenID int) int {
++	t.Helper()
++	var tok model.Token
++	require.NoError(t, model.DB.First(&tok, tokenID).Error)
++	return tok.RemainQuota
++}
++
++func TestStrictForcePreConsumePreventsTrustAboveThreshold(t *testing.T) {
++	truncate(t)
++	const seed = 10000000 // above GetTrustQuota (10 * QuotaPerUnit)
++	seedUser(t, 1, seed)
++	seedToken(t, 1, 1, "sk-strict-trust", seed)
++
++	newSession := func(force bool) *BillingSession {
++		info := strictRelayInfo(1, 1, "sk-strict-trust")
++		info.TokenUnlimited = true
++		info.UserQuota = seed
++		info.ForcePreConsume = force
++		s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++		require.Nil(t, apiErr)
++		require.NotNil(t, s)
++		return s
++	}
++
++	plain := newSession(false)
++	assert.True(t, plain.trusted, "high-balance session without force must take the trust bypass")
++	assert.Equal(t, 0, plain.tokenConsumed)
++	assert.Equal(t, seed, userQuotaNow(t, 1))
++	assert.Equal(t, seed, tokenRemainNow(t, 1))
++
++	// The trusted call changed no quota; reuse that same fixture for forced admission.
++	forced := newSession(true)
++	assert.False(t, forced.trusted, "ForcePreConsume must prevent the trust bypass")
++	assert.Equal(t, 1000, forced.tokenConsumed)
++	assert.Equal(t, seed-1000, userQuotaNow(t, 1))
++	assert.Equal(t, seed-1000, tokenRemainNow(t, 1))
++}
++
++func TestStrictOversizedSettlementDeniedReservationPreserved(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-cap", 2000)
++
++	info := strictRelayInfo(1, 1, "sk-strict-cap")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++	require.Equal(t, 1000, userQuotaNow(t, 1))
++	require.Equal(t, 1000, tokenRemainNow(t, 1))
++
++	err := s.Settle(1368)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "exceeds reserved")
++	assert.False(t, s.settled, "failed strict settle must leave the session unsettled")
++	assert.Equal(t, 1000, userQuotaNow(t, 1), "reservation preserved on user quota")
++	assert.Equal(t, 1000, tokenRemainNow(t, 1), "reservation preserved on token quota")
++
++	s.Refund(strictTestContext())
++	// Undispatched strict refund is synchronous: restoration is visible the
++	// moment Refund returns (old async code needed Eventually here and fails
++	// an immediate check).
++	assert.Equal(t, 2000, userQuotaNow(t, 1), "undispatched refund must restore the preserved reservation")
++	assert.Equal(t, 2000, tokenRemainNow(t, 1), "undispatched refund must restore the preserved reservation")
++}
++
++func TestStrictDispatchedUncertainResultRetainsReservation(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-dispatched", 2000)
++
++	info := strictRelayInfo(1, 1, "sk-strict-dispatched")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++
++	require.Error(t, s.Settle(1368), "oversized actual must fail even after dispatch")
++	info.StrictTextDispatched = true // as compatible_handler does post-dispatch
++	s.Refund(strictTestContext())
++	require.Never(t, func() bool {
++		return userQuotaNow(t, 1) != 1000 || tokenRemainNow(t, 1) != 1000
++	}, 2*time.Second, 50*time.Millisecond,
++		"uncertain inference must not become a free retry: reservation retained, no funding/refund calls")
++	assert.False(t, s.settled)
++}
++
++func TestStrictSettlementRefundsUnusedOnce(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-once", 2000)
++
++	info := strictRelayInfo(1, 1, "sk-strict-once")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++
++	require.NoError(t, s.Settle(800))
++	assert.True(t, s.settled)
++	assert.Equal(t, 1200, userQuotaNow(t, 1), "unused 200 of 1000 must be refunded once")
++	assert.Equal(t, 1200, tokenRemainNow(t, 1))
++
++	s.Refund(strictTestContext())
++	assert.Equal(t, 1200, userQuotaNow(t, 1), "post-settle refund must be a no-op")
++	assert.Equal(t, 1200, tokenRemainNow(t, 1), "post-settle refund must be a no-op")
++
++	require.NoError(t, s.Settle(800), "repeat settle must be idempotent")
++	assert.Equal(t, 1200, userQuotaNow(t, 1))
++}
++
++func TestNormalOversizedSettlementStillDebits(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 1000)
++	seedToken(t, 1, 1, "sk-normal-cap", 1000)
++
++	info := strictRelayInfo(1, 1, "sk-normal-cap")
++	info.ForcePreConsume = true
++	s, apiErr := NewBillingSession(strictTestContext(), info, 756)
++	require.Nil(t, apiErr)
++
++	require.NoError(t, s.Settle(1368), "non-strict path keeps legacy over-reservation debit")
++	assert.Equal(t, 1000-1368, userQuotaNow(t, 1))
++	assert.Equal(t, 1000-1368, tokenRemainNow(t, 1))
++}
++
++func TestStrictNativeReservationRejectsUnaffordableRequest(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 1000)
++	seedToken(t, 1, 1, "sk-strict-unaffordable", 1000)
++	info := strictRelayInfo(1, 1, "sk-strict-unaffordable")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	session, err := NewBillingSession(strictTestContext(), info, 1368)
++	require.NotNil(t, err)
++	require.Nil(t, session)
++	assert.Equal(t, 1000, userQuotaNow(t, 1))
++	assert.Equal(t, 1000, tokenRemainNow(t, 1))
++}
++
++// A real SQL failure after the first balance write must not split the ledger.
++func TestStrictSettlementSQLFailureKeepsBothBalances(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-sql-failure", 2000)
++	info := strictRelayInfo(1, 1, "sk-strict-sql-failure")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	session, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++	require.NoError(t, model.DB.Exec(`CREATE TRIGGER fail_strict_refund BEFORE UPDATE ON tokens
++        WHEN NEW.remain_quota > OLD.remain_quota BEGIN SELECT RAISE(ABORT, 'injected token write failure'); END`).Error)
++	t.Cleanup(func() { model.DB.Exec("DROP TRIGGER IF EXISTS fail_strict_refund") })
++	require.Error(t, session.Settle(800))
++	assert.Equal(t, 1000, userQuotaNow(t, 1), "failed settlement must preserve the full user reservation")
++	assert.Equal(t, 1000, tokenRemainNow(t, 1), "failed settlement must preserve the full token reservation")
++}
++
++func userStatsNow(t *testing.T, userID int) (usedQuota, requestCount int) {
++	t.Helper()
++	var user model.User
++	require.NoError(t, model.DB.Select("used_quota", "request_count").First(&user, userID).Error)
++	return user.UsedQuota, user.RequestCount
++}
++
++func channelUsedNow(t *testing.T, channelID int) int64 {
++	t.Helper()
++	var channel model.Channel
++	require.NoError(t, model.DB.Select("used_quota").First(&channel, channelID).Error)
++	return channel.UsedQuota
++}
++
++// Known-result recovery through a live session: record the verdict, settle
++// with exactly that actual, and prove balances plus statistics commit once.
++func TestStrictKnownResultRecordedThenSettledThroughSession(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-known", 2000)
++	seedChannel(t, 7)
++
++	info := strictRelayInfo(1, 1, "sk-strict-known")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	info.ChannelId = 7
++	s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++	require.NotEmpty(t, info.RequestId)
++
++	_, err := model.MarkStrictTextReservationDispatched(info.RequestId)
++	require.NoError(t, err)
++	_, err = model.RecordStrictTextResult(info.RequestId, 9, 1, 800)
++	require.NoError(t, err)
++
++	require.NoError(t, s.Settle(800))
++	assert.True(t, s.StrictStatsCommitted(), "durable settle must own the statistics commit")
++	assert.Equal(t, 1200, userQuotaNow(t, 1))
++	assert.Equal(t, 1200, tokenRemainNow(t, 1))
++	used, count := userStatsNow(t, 1)
++	assert.Equal(t, 800, used, "statistics must commit exactly once, not via legacy writes too")
++	assert.Equal(t, 1, count)
++	assert.EqualValues(t, 800, channelUsedNow(t, 7))
++
++	require.NoError(t, s.Settle(800), "repeat settle must be idempotent")
++	used, count = userStatsNow(t, 1)
++	assert.Equal(t, 800, used)
++	assert.Equal(t, 1, count)
++	assert.EqualValues(t, 800, channelUsedNow(t, 7))
++}
++
++// Old failure: settling a recorded verdict with a different actual silently
++// replaced it. New success: the recorded known result wins and the
++// reservation is preserved for the correct actual.
++func TestStrictRecordedMismatchRefusesSettle(t *testing.T) {
++	truncate(t)
++	seedUser(t, 1, 2000)
++	seedToken(t, 1, 1, "sk-strict-mismatch", 2000)
++
++	info := strictRelayInfo(1, 1, "sk-strict-mismatch")
++	info.ForcePreConsume = true
++	info.StrictTextBilling = true
++	s, apiErr := NewBillingSession(strictTestContext(), info, 1000)
++	require.Nil(t, apiErr)
++
++	_, err := model.MarkStrictTextReservationDispatched(info.RequestId)
++	require.NoError(t, err)
++	_, err = model.RecordStrictTextResult(info.RequestId, 9, 1, 800)
++	require.NoError(t, err)
++
++	require.Error(t, s.Settle(801), "recorded actual 800 must reject settle 801")
++	assert.False(t, s.StrictStatsCommitted())
++	assert.Equal(t, 1000, userQuotaNow(t, 1), "mismatched settle must preserve the reservation")
++	assert.Equal(t, 1000, tokenRemainNow(t, 1))
++	used, count := userStatsNow(t, 1)
++	assert.Equal(t, 0, used, "refused settlement must leave no statistics behind")
++	assert.Equal(t, 0, count)
++
++	require.NoError(t, s.Settle(800), "the recorded actual still settles afterwards")
++	assert.Equal(t, 1200, userQuotaNow(t, 1))
++	used, count = userStatsNow(t, 1)
++	assert.Equal(t, 800, used)
++	assert.Equal(t, 1, count)
++}
++
++func TestStrictResultWriteFailureCannotSettleOrLog(t *testing.T) {
++	for _, tc := range []struct {
++		name, trigger string
++		recorded      bool
++	}{
++		{"record", "BEFORE UPDATE OF result_recorded ON strict_text_reservations", false},
++		{"settle", "BEFORE UPDATE OF state ON strict_text_reservations WHEN NEW.state = 'SETTLED'", true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			truncate(t)
++			seedUser(t, 1, 2000)
++			seedToken(t, 1, 1, "sk-result-failure", 2000)
++			info := strictRelayInfo(1, 1, "sk-result-failure")
++			info.StrictTextBilling, info.ForcePreConsume = true, true
++			info.StartTime = time.Now()
++			info.PriceData.ModelRatio = 1
++			info.PriceData.CompletionRatio = 1
++			info.PriceData.GroupRatioInfo.GroupRatio = 1
++			ctx := strictTestContext()
++			session, apiErr := NewBillingSession(ctx, info, 1000)
++			require.Nil(t, apiErr)
++			info.Billing = session
++			_, err := model.MarkStrictTextReservationDispatched(info.RequestId)
++			require.NoError(t, err)
++			require.NoError(t, model.DB.Exec("CREATE TRIGGER fail_result "+tc.trigger+" BEGIN SELECT RAISE(ABORT, 'injected result write failure'); END").Error)
++			t.Cleanup(func() { model.DB.Exec("DROP TRIGGER IF EXISTS fail_result") })
++			PostTextConsumeQuota(ctx, info, &dto.Usage{PromptTokens: 9, CompletionTokens: 1, TotalTokens: 10}, nil)
++			row, err := model.GetStrictTextReservation(info.RequestId)
++			require.NoError(t, err)
++			assert.Equal(t, model.StrictReservationDispatched, row.State)
++			assert.Equal(t, tc.recorded, row.ResultRecorded)
++			assert.Equal(t, 1000, userQuotaNow(t, 1))
++			assert.Equal(t, 1000, tokenRemainNow(t, 1))
++			used, count := userStatsNow(t, 1)
++			assert.Zero(t, used)
++			assert.Zero(t, count)
++			var logs int64
++			require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("token_id = ?", 1).Count(&logs).Error)
++			assert.Zero(t, logs)
++
++		})
++	}
++}
+diff --git a/service/task_billing_test.go b/service/task_billing_test.go
+index de49a24fa..dbca5e79b 100644
+--- a/service/task_billing_test.go
++++ b/service/task_billing_test.go
+@@ -48,6 +48,7 @@ func TestMain(m *testing.M) {
+ 		&model.Task{},
+ 		&model.User{},
+ 		&model.Token{},
++		&model.StrictTextReservation{},
+ 		&model.Log{},
+ 		&model.Channel{},
+ 		&model.Midjourney{},
+@@ -72,6 +73,7 @@ func truncate(t *testing.T) {
+ 		model.DB.Exec("DELETE FROM tasks")
+ 		model.DB.Exec("DELETE FROM users")
+ 		model.DB.Exec("DELETE FROM tokens")
++		model.DB.Exec("DELETE FROM strict_text_reservations")
+ 		model.DB.Exec("DELETE FROM logs")
+ 		model.DB.Exec("DELETE FROM channels")
+ 		model.DB.Exec("DELETE FROM midjourneys")
+diff --git a/service/text_quota.go b/service/text_quota.go
+index d2df20427..ecbabb5d9 100644
+--- a/service/text_quota.go
++++ b/service/text_quota.go
+@@ -22,6 +22,21 @@ import (
+ 	"github.com/shopspring/decimal"
+ )
+ 
++// strictDurableBillingSession returns the durable strict session behind a
++// relay billing handle, or nil for every other path. Only that path owns
++// the known-result record and the atomic balance+statistics settlement;
++// legacy, task, audio and non-strict flows are untouched.
++func strictDurableBillingSession(relayInfo *relaycommon.RelayInfo) *BillingSession {
++	if relayInfo == nil || !relayInfo.StrictTextBilling {
++		return nil
++	}
++	session, ok := relayInfo.Billing.(*BillingSession)
++	if !ok || session == nil || session.durableRequestId == "" {
++		return nil
++	}
++	return session
++}
++
+ // ToolSurchargeItem is one billable tool-call line for consume logs.
+ type ToolSurchargeItem struct {
+ 	Name  string  `json:"name"`
+@@ -452,6 +467,17 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+ 	if !summary.hasBillableUsage() {
+ 		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
+ 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
++	} else if strictSession := strictDurableBillingSession(relayInfo); strictSession != nil {
++		// Known upstream verdict: retain actual quota and input/output usage
++		// durably BEFORE settlement. Balance and statistics then commit
++		// together inside settlement, so the legacy separate statistics
++		// writes below are skipped and can never run ahead of the money.
++		// If persistence fails, retain the reservation; do not claim settlement
++		// or publish a consume log without the durable usage record.
++		if _, recordErr := model.RecordStrictTextResult(relayInfo.RequestId, summary.PromptTokens, summary.CompletionTokens, summary.Quota); recordErr != nil {
++			logger.LogError(ctx, "error recording strict result: "+recordErr.Error())
++			return
++		}
+ 	} else {
+ 		model.UpdateUserUsedQuotaAndRequestCount(relayInfo.UserId, summary.Quota)
+ 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
+@@ -459,6 +485,9 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
+ 
+ 	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
+ 		logger.LogError(ctx, "error settling billing: "+err.Error())
++		if strictDurableBillingSession(relayInfo) != nil {
++			return
++		}
+ 	}
+ 
+ 	logModel := summary.ModelName

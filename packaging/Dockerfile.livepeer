@@ -1,0 +1,5 @@
+FROM python@sha256:a0c2acf33d1ad5355112e8ae578908f867a76f70f487b4632792d96889d78b7a
+COPY --chmod=0555 livepeer /usr/local/bin/livepeer
+USER 1000:1000
+WORKDIR /data
+ENTRYPOINT ["/usr/local/bin/livepeer"]

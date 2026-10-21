@@ -1,0 +1,16 @@
+[
+  {
+    "name": "new-api",
+    "repository": "https://github.com/QuantumNous/new-api.git",
+    "base_commit": "2906e4f779b715f282ae11203211dca77051d5af",
+    "source_tree": "74fb7c8f3e34832a7e3c855510db086ebc683147",
+    "patch_sha256": "fba138019e2d736239339a31b6a28ad223353e48aae239e2c814cf2890711392"
+  },
+  {
+    "name": "go-livepeer",
+    "repository": "https://github.com/its-DeFine/go-livepeer.git",
+    "base_commit": "1b2ba1552a30368cec0af01d68945ed01c2900fd",
+    "source_tree": "fccfea64968c5706e7c37735cd1e2a5bcace2ddc",
+    "patch_sha256": "8fe9f1282bb5455635134d78f2633d816eccf83288c27c80de7d925e4be310ec"
+  }
+]

@@ -1,0 +1,16 @@
+Punch Compute
+Copyright 2026 Atumera LLC
+
+First-party workload, CLI, configuration, tests and documentation are licensed
+under Apache-2.0; see LICENSE.
+
+The go-livepeer patch in native/go-livepeer.patch modifies MIT-licensed
+go-livepeer. Its upstream license is preserved in native/licenses/go-livepeer-LICENSE.
+The New API patch in native/new-api.patch modifies AGPL-3.0-licensed New API
+and is distributed under AGPL-3.0. Its license is preserved in
+native/licenses/new-api-LICENSE. The Apache grant does not replace these
+third-party licenses. Exact upstream source commits and patch hashes are in
+native/sources.json; native/README.md describes source reconstruction.
+
+The llama.cpp image and Python/container dependencies retain their respective
+upstream licenses. Model weights are obtained separately under their own terms.

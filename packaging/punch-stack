@@ -1,0 +1,224 @@
+#!/bin/sh
+# Whole-stack control for the Phase 1 seller bundle. No secrets printed.
+# up: verify pins/paths -> mkdirs as caller -> start model+new-api (readiness)
+#     -> host setup.py against loopback gateway -> start order-api (readiness).
+# On any failure: state and running dependencies are preserved; nothing is
+# cleaned up or reset. setup.py lives next to compose.yaml in the bundle.
+set -eu
+CALLER_DIR=$(pwd -P)
+cd "$(dirname "$0")"
+
+ACTION=${1:-status}
+[ "$#" -eq 0 ] || shift
+# Normal setup shares the updater lock. The updater already holds that lock
+# when it invokes up; its operation ID is checked again by guard below.
+if [ "$ACTION" = up ] && [ -f ./update.py ] && [ -z "${PUNCH_UPDATE_OPERATION:-}" ] && [ -z "${PUNCH_SETUP_LOCK_HELD:-}" ]; then
+  export PUNCH_SETUP_CALLER_DIR="$CALLER_DIR"
+  exec python3 ./update.py --root "$PWD" setup -- "$@"
+fi
+NATIVE_CONFIG=""
+NODE_ACCOUNT=""
+OFFER_FILE=""
+AUTO_UPDATE=""
+if [ "$ACTION" = up ] || [ "$ACTION" = preflight ]; then
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --auto-update) [ "$#" -ge 2 ] || exit 2; AUTO_UPDATE=$2; shift 2 ;;
+      --offer) [ "$#" -ge 2 ] || exit 2; OFFER_FILE=$2; shift 2 ;;
+      --native-config) [ "$#" -ge 2 ] || exit 2; NATIVE_CONFIG=$2; shift 2 ;;
+      --node-account) [ "$#" -ge 2 ] || exit 2; NODE_ACCOUNT=$2; shift 2 ;;
+      *) echo 'punch-stack: unknown setup argument' >&2; exit 2 ;;
+    esac
+  done
+fi
+if [ -n "$NATIVE_CONFIG" ]; then
+  case "$NATIVE_CONFIG" in /*) ;; *) NATIVE_CONFIG="$CALLER_DIR/$NATIVE_CONFIG" ;; esac
+fi
+MODEL_ENABLED=false
+if [ -n "$OFFER_FILE" ] || [ -e ./models/default.json ]; then
+  MODEL_ENABLED=true
+  if [ -n "$OFFER_FILE" ]; then
+    case "$OFFER_FILE" in /*) ;; *) OFFER_FILE="$CALLER_DIR/$OFFER_FILE" ;; esac
+    [ -f "$OFFER_FILE" ] || { echo 'punch-stack: offer file missing' >&2; exit 2; }
+  fi
+  export COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}:compose.models.yaml"
+  # Base-file interpolation still runs before the router override replaces
+  # that legacy mount. This placeholder is never mounted in model mode.
+  export MODEL_GGUF_PATH="${MODEL_GGUF_PATH:-$PWD/models/default.gguf}"
+fi
+export PUNCH_MODEL_ENABLED="$MODEL_ENABLED"
+NATIVE_RETAINED=false
+if [ "$ACTION" = up ] || [ "$ACTION" = preflight ]; then
+  NATIVE_RETAINED=$(python3 - <<'RETAINED'
+import json, pathlib, sys
+try:
+    path=pathlib.Path('app/data/setup-state.json')
+    state=json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(state,dict):raise ValueError()
+    print('true' if state.get('native_account') else 'false')
+except (OSError,ValueError):
+    print('punch-stack: setup state unreadable; refusing startup',file=sys.stderr)
+    sys.exit(1)
+RETAINED
+  ) || exit 1
+fi
+NATIVE_ENABLED=false
+if [ -n "$NATIVE_CONFIG" ] || [ "$NATIVE_RETAINED" = true ] || [ -d ./native ] || [ -e ./app/native.registration ]; then
+  NATIVE_ENABLED=true
+  export COMPOSE_PROFILES="${COMPOSE_PROFILES:+$COMPOSE_PROFILES,}livepeer"
+  export GW_LIVEPEER_CHECKOUT=true
+  export GW_NATIVE_NODE_BASE=http://livepeer:8935
+  export GW_NATIVE_REGISTRATION_FILE=/run/punch/native.registration
+  export GW_NATIVE_RUNNER_URL=http://order-api:18086
+fi
+[ -z "$NODE_ACCOUNT" ] || [ "$NATIVE_ENABLED" = true ] || {
+  echo 'punch-stack: --node-account requires native configuration' >&2; exit 2;
+}
+
+SETUP_PY=""
+for candidate in ./setup.py ../setup.py; do
+  if [ -f "$candidate" ]; then SETUP_PY="$candidate"; break; fi
+done
+
+fail() { echo "punch-stack: FAIL $1" >&2; exit 1; }
+
+case "$ACTION" in
+  update|auto-update)
+    [ -f ./update.py ] || fail "update.py missing from release"
+    exec python3 ./update.py --root "$PWD" "$ACTION" "$@"
+    ;;
+  up|preflight)
+    if [ -n "$AUTO_UPDATE" ]; then
+      case "$AUTO_UPDATE" in on|off) ;; *) fail "auto-update must be on or off" ;; esac
+    fi
+    if [ -f ./update.py ]; then python3 ./update.py --root "$PWD" guard || exit 1; fi
+    [ "$(id -u)" = "1000" ] || fail "caller-uid-not-1000 (current profile requires UID 1000)"
+    [ -n "$SETUP_PY" ] || fail "setup.py not found next to compose.yaml"
+    command -v python3 >/dev/null 2>&1 || fail "python3 missing on host"
+    # Resolve .env and exported values exactly as Compose does. Never source
+    # .env as shell code or independently guess a possibly different API port.
+    GATEWAY_PORT=$(python3 - "$ACTION" <<'CONFIG'
+import hashlib, json, os, pathlib, subprocess, sys
+try:
+    config = json.loads(subprocess.check_output(['docker','compose','config','--format','json']))
+    services = config['services']
+    images=[services[n]['image'] for n in ('new-api','order-api')]
+    if os.environ.get('GW_LIVEPEER_CHECKOUT')=='true':
+        images.append(services['livepeer']['image'])
+    def installed(image):
+        p=subprocess.run(['docker','image','inspect','--format','{{.Id}}',image],capture_output=True,text=True)
+        return p.returncode==0 and p.stdout.strip()==image
+    if not all(installed(image) for image in images):
+        if sys.argv[1]!='up':
+            raise ValueError('release images unavailable; up loads the verified bundle')
+        archive=pathlib.Path('images.tar.gz')
+        expected=pathlib.Path('images.sha256').read_text().strip()
+        digest=hashlib.sha256()
+        with archive.open('rb') as f:
+            for chunk in iter(lambda:f.read(1024*1024),b''):digest.update(chunk)
+        actual=digest.hexdigest()
+        if actual!=expected:raise ValueError('image archive checksum mismatch')
+        subprocess.run(['docker','load','-i',str(archive)],stdout=sys.stderr,check=True)
+        if not all(installed(image) for image in images):raise ValueError('release image identity mismatch')
+    if os.environ.get('PUNCH_MODEL_ENABLED') != 'true':
+        model = next(v['source'] for v in services['model']['volumes'] if v['target']=='/model.gguf')
+        if not pathlib.Path(model).is_file() or not os.access(model,os.R_OK):
+            raise ValueError('model weights unavailable to service user')
+    port = next(p for p in services['new-api']['ports'] if p['target']==3000)
+    if port['host_ip'] != '127.0.0.1' or not 1 <= int(port['published']) <= 65535:
+        raise ValueError('private gateway port required')
+    for directory in ('newapi-data','app/data'):
+        p=pathlib.Path(directory)
+        if p.is_symlink() or (p.exists() and (not p.is_dir() or not os.access(p,os.W_OK|os.X_OK))):
+            raise ValueError('persistent directory unavailable to service user: '+directory)
+    print(port['published'])
+except (OSError,ValueError,KeyError,StopIteration,subprocess.SubprocessError) as error:
+    print('punch-stack: configuration/preflight failed: '+str(error),file=sys.stderr)
+    sys.exit(1)
+CONFIG
+    ) || fail "compose preflight failed (nothing started)"
+    if [ "$ACTION" = "preflight" ]; then
+      echo "punch-stack: preflight passed; gateway=127.0.0.1:${GATEWAY_PORT}"
+      exit 0
+    fi
+    umask 077
+    mkdir -p ./newapi-data ./app/data
+    if [ "$MODEL_ENABLED" = true ]; then
+      mkdir -p ./models
+      MODEL_GPU_LAYERS=$(docker compose config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["order-api"]["environment"]["GW_MODEL_GPU_LAYERS"])')
+      if [ -n "$OFFER_FILE" ]; then
+        docker compose run --rm --no-deps -v "$OFFER_FILE:/run/punch-offer.json:ro" order-api \
+          python3 /app/seller_model.py prepare --offer /run/punch-offer.json --root /models \
+          --gpu-layers "$MODEL_GPU_LAYERS" \
+          || fail "default model preparation failed (cache/state preserved)"
+      fi
+      [ -f ./models/default.json ] || fail "verified default model unavailable"
+    fi
+    docker compose up -d --wait --wait-timeout 240 model new-api \
+      || fail "model/new-api failed readiness (state preserved, run status/logs)"
+    set -- --bundle-root . --api-base "http://127.0.0.1:${GATEWAY_PORT}"
+    if [ "$NATIVE_ENABLED" = true ]; then set -- "$@" --livepeer; fi
+    if [ -n "$NATIVE_CONFIG" ]; then set -- "$@" --native-config "$NATIVE_CONFIG"; fi
+    if [ -n "$NODE_ACCOUNT" ]; then set -- "$@" --node-account "$NODE_ACCOUNT"; fi
+    if [ "$MODEL_ENABLED" = true ]; then set -- "$@" --model-profile ./models/default.json; fi
+    # A generated config update must reach the running native process.
+    # The setup/update maintenance guard above owns this lifecycle change.
+    native_config_digest() {
+      python3 -c 'import hashlib,pathlib; p=pathlib.Path("native/node.conf"); print(hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else "missing")'
+    }
+    NATIVE_CONFIG_BEFORE=$(native_config_digest)
+    python3 "$SETUP_PY" "$@" \
+      || fail "setup.py failed (new-api left running, state preserved)"
+    if [ "$NATIVE_ENABLED" = true ]; then
+      [ -f ./native/node.conf ] && [ -f ./app/native.registration ] \
+        || fail "native configuration incomplete (state preserved)"
+      if [ "$NATIVE_CONFIG_BEFORE" != "$(native_config_digest)" ]; then
+        docker compose up -d --force-recreate --wait --wait-timeout 120 livepeer \
+          || fail "livepeer config update failed readiness (state preserved, run status/logs)"
+      else
+        docker compose up -d --wait --wait-timeout 120 livepeer \
+          || fail "livepeer failed readiness (state preserved, run status/logs)"
+      fi
+    fi
+    docker compose up -d --wait --wait-timeout 120 order-api \
+      || fail "order-api failed readiness (model/new-api left running)"
+    if [ "$MODEL_ENABLED" = true ]; then
+      python3 - <<'PUBLISH'
+import json, pathlib, subprocess, urllib.request, urllib.error
+root=pathlib.Path('.')
+manifest=json.loads((root/'models/default.json').read_text())
+offer=manifest['offer']
+config=json.loads(subprocess.check_output(['docker','compose','config','--format','json']))
+port=next(p['published'] for p in config['services']['order-api']['ports'] if p['target']==18086)
+base='http://127.0.0.1:'+str(port)
+# A retained offer is never republished, unwithdrawn, or replaced on restart.
+try:
+    with urllib.request.urlopen(base+'/offers/'+offer['offer_id']) as response:
+        existing=json.load(response)['data']
+except urllib.error.HTTPError as error:
+    if error.code!=404:raise
+    existing=None
+if existing is None:
+    body=dict(offer,seller_token=(root/'app/seller.token').read_text().strip())
+    request=urllib.request.Request(base+'/offers',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+    with urllib.request.urlopen(request) as response:
+        if not json.load(response).get('success'):raise RuntimeError('offer publication rejected')
+elif any(existing.get(k)!=offer[k] for k in ('model','input_rate','output_rate','cache_rate','allowance_credits','window_seconds','model_coverage','strict_text_policy','native_runner_id') if k in offer) or ('native_recipient_address' in offer and str(existing.get('native_recipient_address')).lower()!=str(offer['native_recipient_address']).lower()) or ('price_wei' in offer and str(existing.get('price_wei'))!=str(offer['price_wei'])):
+    raise RuntimeError('retained offer terms differ; use an explicit new offer revision')
+print(json.dumps({'seller':'ready','model':offer['model'],'offer_id':offer['offer_id'],'offer_status':'withdrawn' if existing and existing.get('withdrawn') else 'published'}))
+PUBLISH
+    fi
+    docker compose ps
+    if [ "$ACTION" = up ] && [ -n "$AUTO_UPDATE" ]; then
+      python3 ./update.py --root "$PWD" auto-update "$AUTO_UPDATE" || exit 1
+    fi
+    ;;
+  stop) docker compose stop -t 30 ;;
+  status) docker compose ps --all "$@" ;;
+  diagnose) exec python3 ./diagnostics.py ;;
+  config) docker compose config --format json ;;
+  logs)
+    if [ "$#" -gt 0 ]; then docker compose logs --tail 40 "$1"
+    else docker compose logs --tail 40; fi ;;
+  *) echo 'usage: punch-stack up|preflight [--offer FILE] [--native-config FILE] [--node-account ADDRESS] [--auto-update on|off] | update [--channel URL] | auto-update on|off | diagnose | stop|status|logs [service]' >&2; exit 2 ;;
+esac

@@ -1,0 +1,18 @@
+# Optional verified registry/default-model mode, selected by punch-stack --offer.
+# Router can only read model artifacts; the wrapper owns private cache/catalog writes.
+services:
+  model:
+    volumes: !override
+      - ./models:/models:ro
+    command: ["--models-preset", "/models/models.ini", "--models-max", "0", "--no-models-autoload", "--host", "0.0.0.0", "--port", "8080", "--metrics"]
+  order-api:
+    environment:
+      GW_MODEL_ROOT: /models
+      GW_MODEL_ROUTER: http://model:8080
+      GW_MODEL_GPU_LAYERS: ${PUNCH_MODEL_GPU_LAYERS:-99}
+      GW_DEFAULT_MODEL_FILE: /models/default.json
+      HF_HUB_DISABLE_XET: "1"
+    volumes:
+      - ./models:/models
+    networks: [front, inference]
+    mem_limit: 1g
