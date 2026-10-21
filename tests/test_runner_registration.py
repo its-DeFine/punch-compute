@@ -392,9 +392,14 @@ class NativeRunnerRegistrationTest(unittest.TestCase):
                     state_path = os.path.join(gateway_root, 'data', 'native_runners.json')
                     with open(state_path, 'rb') as state:
                         retained = json.load(state)[RUNNER]
+                    direct_code, direct = call(base, 'GET', '/health')
+                    self.assertEqual(direct_code, 200)
+                    self.assertTrue(direct['success'])
+                    self.assertTrue(direct['data']['ready'])
                     code, proxied = call(native, 'GET', '/apps/' + RUNNER + '/app/health')
                     self.assertEqual(code, 200)
-                    self.assertTrue(proxied['ok'])
+                    self.assertEqual(proxied['success'], direct['success'])
+                    self.assertEqual(proxied['data'], direct['data'])
                     code, repeat = call(base, 'POST', '/offers', offer_body())
                     self.assertEqual(code, 200)
                     self.assertEqual(repeat['data']['native_registration']['state'], 'ready')
