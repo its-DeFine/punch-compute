@@ -368,7 +368,7 @@ class NativeRunnerRegistrationTest(unittest.TestCase):
                     '-httpAddr', native, '-liveRunnerAddr', native,
                     '-cliAddr', '127.0.0.1:%d' % cli_port,
                     '-datadir', os.path.join(root, 'node'),
-                    '-monitor=false', '-testOrchAvail=false',
+                    '-monitor=false', '-startupAvailabilityCheck=false',
                     '-pricePerUnit', '1', '-pixelsPerUnit', '1'],
                     stdout=log, stderr=subprocess.STDOUT)
                 try:
