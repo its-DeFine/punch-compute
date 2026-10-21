@@ -1,0 +1,10 @@
+{
+  "url": "https://go.dev/dl/go1.25.0.linux-amd64.tar.gz",
+  "filename": "go1.25.0.linux-amd64.tar.gz",
+  "os": "linux",
+  "arch": "amd64",
+  "version": "go1.25.0",
+  "sha256": "2852af0cb20a13139b3448992e69b868e50ed0f8a1e5940ee1de9e19a123b613",
+  "size": 59659213,
+  "kind": "archive"
+}

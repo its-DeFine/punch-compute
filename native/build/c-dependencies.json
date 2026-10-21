@@ -1,0 +1,20 @@
+[
+  {
+    "name": "ffmpeg",
+    "commit": "d9751c73e714b01b363483db358b1ea8022c9bea",
+    "archive": "ffmpeg-d9751c73e714.tar",
+    "sha256": "ce117923092cd4704e7f0a9bb0243f354d21a61c4bdf834a1489fdf727039885"
+  },
+  {
+    "name": "x264",
+    "commit": "545de2ffec6ae9a80738de1b2c8cf820249a2530",
+    "archive": "x264-545de2ffec6a.tar",
+    "sha256": "1435416579ee774460f8f8109c36899f7fb4b4c28d5f87ad8a76d658c253cb14"
+  },
+  {
+    "name": "nv-codec-headers",
+    "commit": "c69278340ab1d5559c7d7bf0edf615dc33ddbba7",
+    "archive": "nv-codec-headers-c69278340ab1.tar",
+    "sha256": "2d7641d7679d4276232c8e0f4d0be8e889b6a354292f56cd3300641c3af9ece4"
+  }
+]

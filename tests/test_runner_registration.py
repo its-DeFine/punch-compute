@@ -137,7 +137,7 @@ def offer_body(**extra):
 
 
 class RunnerRegistrationTest(unittest.TestCase):
-    def start_gateway(self, extra_env=None):
+    def start_gateway(self, extra_env=None, *, advertise_gateway=False):
         tmp = tempfile.mkdtemp(prefix='gw-reg-')
         self.addCleanup(lambda: __import__('shutil').rmtree(tmp, ignore_errors=True))
         data = os.path.join(tmp, 'data')
@@ -162,6 +162,8 @@ class RunnerRegistrationTest(unittest.TestCase):
                    GW_ADMIN_PASS_FILE=secrets['admin_pass'])
         if extra_env:
             env.update(extra_env)
+        if advertise_gateway:
+            env['GW_NATIVE_RUNNER_URL'] = 'http://127.0.0.1:%d' % gw_port
         proc = subprocess.Popen([sys.executable, APP], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         def stop():
@@ -340,6 +342,74 @@ class RunnerRegistrationTest(unittest.TestCase):
         self.addCleanup(lambda: __import__('shutil').rmtree(tmp, ignore_errors=True))
         base, gw_tmp = self.start_gateway(self.registration_env(tmp, native_base))
         return base, os.path.join(gw_tmp, 'data')
+
+
+
+@unittest.skipUnless(os.environ.get('PUNCH_NATIVE_RUNNER_BINARY'),
+                     'NOT_TESTED: explicit rebuilt native binary required')
+class NativeRunnerRegistrationTest(unittest.TestCase):
+    """Real offchain node and real gateway; run inside --network none.
+
+    Only registration, HTTP health proxying and retained republish are used.
+    No purchase, model execution, payer, chain endpoint or signing is invoked.
+    """
+    start_gateway = RunnerRegistrationTest.start_gateway
+    registration_env = RunnerRegistrationTest.registration_env
+
+    def test_real_node_registers_and_proxies_gateway_health(self):
+        with tempfile.TemporaryDirectory(prefix='punch-native-runner-') as root:
+            native_port, cli_port = free_port(), free_port()
+            native = 'http://127.0.0.1:%d' % native_port
+            with open(os.environ.get('PUNCH_NATIVE_LOG', os.path.join(root, 'native.log')), 'wb') as log:
+                proc = subprocess.Popen([
+                    os.environ['PUNCH_NATIVE_RUNNER_BINARY'],
+                    '-network', 'offchain', '-orchestrator', '-useLiveRunners',
+                    '-orchSecret', MASTER, '-serviceAddr', native,
+                    '-httpAddr', native, '-liveRunnerAddr', native,
+                    '-cliAddr', '127.0.0.1:%d' % cli_port,
+                    '-datadir', os.path.join(root, 'node'),
+                    '-monitor=false', '-testOrchAvail=false',
+                    '-pricePerUnit', '1', '-pixelsPerUnit', '1'],
+                    stdout=log, stderr=subprocess.STDOUT)
+                try:
+                    deadline = time.monotonic() + 30
+                    while True:
+                        self.assertIsNone(proc.poll(), 'Native process exited; inspect owned fixture log')
+                        try:
+                            code, _ = call('http://127.0.0.1:%d' % cli_port, 'GET', '/status')
+                            if code == 200:
+                                with socket.create_connection(('127.0.0.1', native_port), timeout=1):
+                                    break
+                        except OSError:
+                            pass
+                        self.assertLess(time.monotonic(), deadline, 'Native readiness timeout')
+                        time.sleep(.1)
+                    base, gateway_root = self.start_gateway(
+                        self.registration_env(root, native), advertise_gateway=True)
+                    code, result = call(base, 'POST', '/offers', offer_body())
+                    self.assertEqual(code, 200)
+                    self.assertEqual(result['data']['native_registration']['state'], 'ready')
+                    state_path = os.path.join(gateway_root, 'data', 'native_runners.json')
+                    with open(state_path, 'rb') as state:
+                        retained = json.load(state)[RUNNER]
+                    code, proxied = call(native, 'GET', '/apps/' + RUNNER + '/app/health')
+                    self.assertEqual(code, 200)
+                    self.assertTrue(proxied['ok'])
+                    code, repeat = call(base, 'POST', '/offers', offer_body())
+                    self.assertEqual(code, 200)
+                    self.assertEqual(repeat['data']['native_registration']['state'], 'ready')
+                    with open(state_path, 'rb') as state:
+                        repeated = json.load(state)[RUNNER]
+                    for key in ('heartbeat_secret', 'runner_url', 'recipient',
+                                'price_wei', 'offer_id', 'model'):
+                        self.assertEqual(repeated[key], retained[key])
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
 
 
 if __name__ == '__main__':

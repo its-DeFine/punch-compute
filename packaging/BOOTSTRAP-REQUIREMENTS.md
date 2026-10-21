@@ -5,14 +5,16 @@
 Use Linux UID/GID 1000, Python 3, Docker Compose supporting `!override`, NVIDIA
 CDI and a suitable GPU. The exact New API, order API and Livepeer images are
 pinned in `compose.yaml`; llama.cpp uses an upstream registry digest. This
-checkout supplies no application image registry or downloadable image archive.
-Obtain the verified runtime bundle before deployment. A freshly rebuilt image
-or historical bundle with different content IDs is not a substitute.
+source checkout uses the matching `20261021-rebuilt` runtime bundle. Verify
+its `SHA256SUMS` before extraction. The bundle contains newly built images from
+the exact accepted native source trees; see `native/sources.json` and the build
+receipt. Other image IDs, including historical artifacts, are not substitutes.
 
 A runtime directory contains `compose.yaml`, `compose.models.yaml`, `punch-stack`,
 `diagnostics.py`, `setup.py`, and `bin/punch-token-orders`, plus `images.tar.gz`
-and `images.sha256` if the exact images are not installed. Copy the first four
-files from this directory and the setup/CLI files from the repository root.
+and `images.sha256`. These files are already arranged in the release bundle;
+when assembling locally, copy the first four files from this directory and the
+setup/CLI files from the repository root.
 `images.sha256` contains the archive's plain SHA-256 hex digest. Keep runtime
 state separate from the source checkout's `app/` and `native/`.
 
@@ -78,5 +80,6 @@ recreate identities. Never delete the ledger, rewind chain history or use
 reservation; restart does not prove that no work occurred.
 
 Automatic updater and release-feed machinery are outside this distribution.
-No update feed is configured. Source tests and historical native evidence do
-not establish new GPU, funded-chain or public runtime-installation acceptance.
+No update feed is configured. The release checks archive loading, local native
+setup with retained state, native config parsing and an isolated offchain runner
+health request. They do not establish GPU inference or funded-chain acceptance.

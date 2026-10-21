@@ -1,0 +1,18 @@
+{
+  "new_api": {
+    "source_tree": "74fb7c8f3e34832a7e3c855510db086ebc683147",
+    "bun_image": "oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6",
+    "go_image": "golang:1.26.1-alpine@sha256:2389ebfa5b7f43eeafbd6be0c3700cc46690ef842ad962f6c5bd6be49ed82039",
+    "toolchain_source": "Exact source Dockerfile",
+    "build_settings": "CGO=0, GOEXPERIMENT=greenteagc, frozen Bun lock and readonly Go modules; descriptive rebuilt version; no source edits"
+  },
+  "go_livepeer": {
+    "source_tree": "fccfea64968c5706e7c37735cd1e2a5bcace2ddc",
+    "builder_image": "ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956",
+    "go_toolchain": "go1.25.0, verified official sha256; see GO-TOOLCHAIN.json",
+    "retained_ci": "linux-amd64 CPU build on ubuntu22.04; mainnet,experimental; install_ffmpeg.sh pinned LPMS46782466",
+    "lpms_install_sha256": "22a3c20e8f906b25b3e0f7867189acdcc769d3617ef651269479e39e23e3ef3e",
+    "build_settings": "CPU dependency path, no CUDA; source readonly; no model/GPU/chain calls; descriptive rebuilt version"
+  },
+  "claims": "Exact source reconstruction, repeatable pinned-input procedure; not historical artifact byte-equivalence or fully hermetic apt/transitive-toolchain reproducibility."
+}

@@ -1,0 +1,70 @@
+{
+  "release": "20261021-rebuilt",
+  "platform": "linux/amd64",
+  "kind": "New artifacts built from exact accepted production-source trees; no historical binary equivalence claim",
+  "sources": [
+    {
+      "name": "new-api",
+      "repository": "https://github.com/QuantumNous/new-api.git",
+      "base_commit": "2906e4f779b715f282ae11203211dca77051d5af",
+      "source_tree": "74fb7c8f3e34832a7e3c855510db086ebc683147",
+      "patch_sha256": "fba138019e2d736239339a31b6a28ad223353e48aae239e2c814cf2890711392"
+    },
+    {
+      "name": "go-livepeer",
+      "repository": "https://github.com/its-DeFine/go-livepeer.git",
+      "base_commit": "1b2ba1552a30368cec0af01d68945ed01c2900fd",
+      "source_tree": "fccfea64968c5706e7c37735cd1e2a5bcace2ddc",
+      "patch_sha256": "8fe9f1282bb5455635134d78f2633d816eccf83288c27c80de7d925e4be310ec"
+    }
+  ],
+  "binaries": {
+    "new-api-strict1": {
+      "sha256": "2d18b9dc9b36bb1662b795dadae1ec9d4c41830fdfd860106a444bb76aa6bdb6",
+      "bytes": 131256482
+    },
+    "livepeer": {
+      "sha256": "31ddc8b25aef434a736963055964582737cea15a5641f906623406a24eed351d",
+      "bytes": 92916408
+    }
+  },
+  "images": {
+    "new-api": {
+      "tag": "punch-token-new-api:20261021-rebuilt",
+      "image_id": "sha256:1890472976789dd2137d83624118bd85b7520b437ca667359646f0f63335b09f"
+    },
+    "order-api": {
+      "tag": "punch-token-order-api:20261021-rebuilt",
+      "image_id": "sha256:132f9a4da9874b1a9ded2394fa166a48026da8252b6a35de3cd9ecfc9759c739"
+    },
+    "livepeer": {
+      "tag": "punch-token-livepeer:20261021-rebuilt",
+      "image_id": "sha256:d217f96f765be2e8c71a637e7315051609554f77c1bc970107ef845b045bc050"
+    }
+  },
+  "source_integrity": "Both indexed Git trees match the recorded source_tree; no tracked worktree changes after builds",
+  "toolchains": {
+    "new-api": "Go1.26.1, Bun1.4.0; exact builder image digests in inputs.json",
+    "livepeer": "Go1.25.0; Ubuntu22.04 CPU build, FFmpeg GPL2-or-later/libx264; no CUDA/nonfree build path"
+  },
+  "verified_before_packaging": {
+    "native_setup_tests": {
+      "passed": 6,
+      "real_native_api": true,
+      "retained_identity": true
+    },
+    "gateway_source_tests": {
+      "passed": 87,
+      "native_parser_skipped_without_old_image": 1
+    },
+    "clean_checkout_cli_tests": {
+      "passed": 4
+    },
+    "gateway_release_rootfs": "Identical to prior tested image233de3e4; version label differs"
+  },
+  "final_runtime_acceptance": "See release asset VALIDATION.json for native parser/runner and cold-bundle results on the final source revision.",
+  "limits": [
+    "No new GPU inference or funded-chain/payment acceptance",
+    "Not a fully hermetic or byte-reproducibility claim; apt/transitive build inputs resolved at build time"
+  ]
+}

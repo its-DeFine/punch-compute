@@ -13,11 +13,20 @@ Buyer applications integrate through the [HTTP contract](USAGE.md).
 
 Deployment requires the exact application images in
 [`packaging/compose.yaml`](packaging/compose.yaml), Linux UID/GID 1000, Docker
-Compose, NVIDIA CDI and suitable model weights. This checkout does not include
-a runtime image archive or a download location for one. It is not a complete
-installation bundle. Do not substitute stock images or historical bundles.
+Compose, NVIDIA CDI and suitable model weights. Use the matching
+`punch-workload-20261021-rebuilt-linux-amd64.tar.gz` release bundle and
+`SHA256SUMS`. The bundle contains the three application images, runtime files
+and CLI. The llama.cpp image and model weights are fetched separately.
 
-When the exact images are available, follow [setup and recovery](packaging/BOOTSTRAP-REQUIREMENTS.md).
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf punch-workload-20261021-rebuilt-linux-amd64.tar.gz
+cd punch-workload-20261021-rebuilt-linux-amd64
+```
+
+This release is newly built from the exact source trees in `native/sources.json`;
+it does not claim historical binary equivalence. Keep its Compose file and image
+archive together. Follow [setup and recovery](packaging/BOOTSTRAP-REQUIREMENTS.md).
 From the prepared runtime directory:
 
 ```sh
@@ -46,10 +55,11 @@ docker run --rm --network none --read-only --user 1000:1000 \
 ```
 
 These tests exercise provider logic, the actual gateway and CLI on loopback,
-and synthetic native/ledger boundaries. The native binary parser fixture
-explicitly skips without its designated image. A source test image rebuilt
-today does not prove byte identity with the deployment image, GPU inference,
-chain acceptance or a clean runtime installation.
+and synthetic native/ledger boundaries. Native parser, real setup and offchain
+runner fixtures skip unless their explicit artifact inputs are supplied; see
+[native build and validation](native/README.md). The release receipt records
+which checks ran against which artifacts. Local setup, archive loading and
+runner health checks do not establish GPU inference or funded-chain acceptance.
 
 ## Source and licensing
 

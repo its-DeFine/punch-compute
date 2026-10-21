@@ -12,5 +12,11 @@ native/licenses/new-api-LICENSE. The Apache grant does not replace these
 third-party licenses. Exact upstream source commits and patch hashes are in
 native/sources.json; native/README.md describes source reconstruction.
 
+The retained LPMS dependency installer is MIT licensed; see native/licenses/lpms-LICENSE.
+The CPU native build uses FFmpeg with --enable-gpl and links libx264.
+Those components retain their GPL licenses and corresponding sources; see
+native/licenses/ and the release corresponding-source archive. The MIT notice
+for go-livepeer source is not a claim that every linked component is MIT.
+
 The llama.cpp image and Python/container dependencies retain their respective
 upstream licenses. Model weights are obtained separately under their own terms.

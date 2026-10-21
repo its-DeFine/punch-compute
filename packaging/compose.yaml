@@ -4,7 +4,7 @@ name: punch-token-orders
 services:
   livepeer:
     profiles: [livepeer]
-    image: sha256:870be6a4ade75a55483cbc9671653acdb35c1d28e5b49627a32fda07ef566dde
+    image: sha256:d217f96f765be2e8c71a637e7315051609554f77c1bc970107ef845b045bc050
     pull_policy: never
     user: "1000:1000"
     read_only: true
@@ -62,7 +62,7 @@ services:
       options: {max-size: "10m", max-file: "2"}
 
   new-api:
-    image: sha256:7a50606673b08d9b1518a2f6b485c56effcc17f6c0a2b1a5e89264ceb7691c2c
+    image: sha256:1890472976789dd2137d83624118bd85b7520b437ca667359646f0f63335b09f
     pull_policy: never
     user: "1000:1000"
     read_only: true
@@ -103,7 +103,7 @@ services:
       options: {max-size: "10m", max-file: "2"}
 
   order-api:
-    image: sha256:2acfe4522bd28bc9b5ac207a66a631d3956ae82b0f7cbb5e8a78156af021ed2d
+    image: sha256:132f9a4da9874b1a9ded2394fa166a48026da8252b6a35de3cd9ecfc9759c739
     pull_policy: never
     user: "1000:1000"
     read_only: true
