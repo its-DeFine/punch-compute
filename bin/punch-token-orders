@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Thin CLI over the order gateway + New API. Mapping only; balances in New API.
+
+Buyer commands use a buyer credentials file (0600, {username, password});
+seller commands use a seller token file (0600, raw token). Nothing secret is
+logged. Acquisition saves order credentials in a private file and prints its path.
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+from urllib.error import HTTPError
+
+GW = os.environ.get("PUNCH_ORDER_GATEWAY", "http://127.0.0.1:18086")
+
+
+def _req(method, url, body=None, headers=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.load(r)
+    except HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except ValueError:
+            return e.code, {"success": False, "code": f"http_{e.code}"}
+
+
+def gw(method, path, body=None):
+    return _req(method, GW.rstrip("/") + path, body,
+                {"Content-Type": "application/json"})
+
+
+def read_secret_file(path):
+    with open(path, encoding="utf-8") as f:
+        if os.fstat(f.fileno()).st_mode & 0o077:
+            raise SystemExit("credentials file must be private (mode 0600)")
+        return f.read().strip()
+
+
+def write_private(path, value):
+    os.umask(0o077)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(value, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def buyer_login(api_base, creds_file):
+    creds = json.loads(read_secret_file(creds_file))
+    base = api_base.rstrip("/")
+    cache_path = creds_file + ".session"
+    try:
+        cached = json.loads(read_secret_file(cache_path))
+    except FileNotFoundError:
+        cached = {}
+    if (cached.get("api") == base and cached.get("username") == creds["username"]
+            and cached.get("expires_at", 0) > time.time() + 10):
+        token = cached["token"]
+        code, body = _req("GET", base + "/api/user/self",
+                          headers={"Authorization": "Bearer " + token})
+        if code == 200 and body.get("success"):
+            return token
+        if code not in (401, 403):
+            raise SystemExit(f"buyer session check failed http={code}")
+    code, body = _req("POST", base + "/api/user/login",
+                      {"username": creds["username"], "password": creds["password"]},
+                      {"Content-Type": "application/json"})
+    if code != 200 or not body.get("success"):
+        raise SystemExit(f"buyer login failed http={code}; no automatic login retry")
+    data = body["data"]
+    write_private(cache_path, {"api": base, "username": creds["username"],
+        "token": data["access_token"], "expires_at": data["access_expires_at"]})
+    return data["access_token"]
+
+
+def cmd_offer_publish(a):
+    tok = read_secret_file(a["--seller-token-file"])
+    if a.get("--offer-file") is not None:
+        with open(a["--offer-file"], encoding="utf-8") as f:
+            offer = json.load(f)
+        if not isinstance(offer, dict):
+            raise SystemExit("offer file must contain a JSON object")
+        offer = dict(offer)
+    else:
+        offer = {
+            "offer_id": a["--offer-id"], "model": a["--model"],
+            "input_rate": float(a["--input-rate"]), "output_rate": float(a["--output-rate"]),
+            "cache_rate": float(a.get("--cache-rate", "1")),
+            "allowance_credits": int(a["--allowance"]), "window_seconds": int(a["--window"]),
+        }
+        native = (a.get("--native-runner-id"), a.get("--native-recipient-address"),
+                  a.get("--price-wei"))
+        if any(v is not None for v in native):
+            if not all(v is not None for v in native):
+                raise SystemExit("native offer fields must be given all together: "
+                                 "--native-runner-id --native-recipient-address --price-wei")
+            offer["native_runner_id"] = native[0]
+            offer["native_recipient_address"] = native[1]
+            offer["price_wei"] = int(native[2])
+    offer["seller_token"] = tok
+    code, body = gw("POST", "/offers", offer)
+    print(json.dumps({"http": code, "ok": body.get("success"),
+                      "data": body.get("data"), "code": body.get("code")}))
+    return 0 if body.get("success") else 1
+
+
+def cmd_offer_list(a):
+    code, body = gw("GET", "/offers")
+    print(json.dumps({"http": code, "offers": body.get("data")}))
+    return 0 if body.get("success") else 1
+
+
+def cmd_offer_withdraw(a):
+    tok = read_secret_file(a["--seller-token-file"])
+    code, body = gw("POST", "/offers/withdraw",
+                    {"seller_token": tok, "offer_id": a["--offer-id"]})
+    print(json.dumps({"http": code, "ok": body.get("success"), "code": body.get("code")}))
+    return 0 if body.get("success") else 1
+
+
+def maintenance_result(code, body, nonzero_states=()):
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code")}
+    if body.get("success"):
+        out["data"] = body.get("data")
+    print(json.dumps(out))
+    if not body.get("success"):
+        return 1
+    state = ((body.get("data") or {}).get("operation") or {}).get("state")
+    return 1 if state in nonzero_states else 0
+
+
+def cmd_maintenance_status(a):
+    tok = read_secret_file(a["--seller-token-file"])
+    code, body = gw("POST", "/maintenance/status", {"seller_token": tok})
+    return maintenance_result(code, body)
+
+
+def cmd_maintenance_acquire(a):
+    tok = read_secret_file(a["--seller-token-file"])
+    code, body = gw("POST", "/maintenance/acquire",
+                    {"seller_token": tok, "operation_id": a["--operation-id"]})
+    # A REFUSED acquisition stays closed: report nonzero with the structured
+    # blockers, never automatically release the uncertain gate.
+    return maintenance_result(code, body, ("REFUSED",))
+
+
+def cmd_maintenance_release(a):
+    tok = read_secret_file(a["--seller-token-file"])
+    code, body = gw("POST", "/maintenance/release",
+                    {"seller_token": tok, "operation_id": a["--operation-id"]})
+    return maintenance_result(code, body)
+
+
+def cmd_order_acquire(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = gw("POST", "/acquire", {
+        "buyer_token": bt, "offer_id": a["--offer-id"],
+        "idempotency_key": a["--idempotency-key"]})
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code")}
+    if body.get("success"):
+        data = body["data"]
+        output = a.get("--output", a["--buyer-creds"] + "." + data["order_id"] + ".order")
+        if os.path.exists(output):
+            existing = json.loads(read_secret_file(output))
+            if existing.get("order_id") != data["order_id"] or existing.get("order_key") != data["order_key"]:
+                raise SystemExit("refusing to replace different order credentials")
+        else:
+            write_private(output, data)
+        out["data"] = {k: v for k, v in data.items() if k != "order_key"}
+        out["data"]["credentials_file"] = output
+    print(json.dumps(out))
+    return 0 if body.get("success") else 1
+
+
+def cmd_purchase_prepare(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = gw("POST", "/purchases/prepare", {
+        "buyer_token": bt, "offer_id": a["--offer-id"],
+        "idempotency_key": a["--idempotency-key"],
+        "payer_address": a["--payer-address"]})
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code")}
+    if body.get("success"):
+        data = body["data"]
+        output = a.get("--output",
+                       a["--buyer-creds"] + "." + data["order_id"] + ".prepared")
+        if os.path.exists(output):
+            existing = json.loads(read_secret_file(output))
+            if (existing.get("order_id") != data["order_id"]
+                    or existing.get("purchase_intent") != data["purchase_intent"]):
+                raise SystemExit("refusing to replace conflicting prepared identity/intent")
+        else:
+            write_private(output, data)
+        out["data"] = {k: data[k] for k in
+                       ("order_id", "offer_id", "state", "purchase_intent", "expires_at")}
+        out["data"]["prepared_file"] = output
+    print(json.dumps(out))
+    return 0 if body.get("success") else 1
+
+
+
+def cmd_purchase_status(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = _req("GET", GW.rstrip("/") + "/purchases/" + a["--order-id"],
+                      headers={"Authorization": "Bearer " + bt})
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code")}
+    if body.get("success"):
+        data = body["data"]
+        key = data.pop("order_key", None)  # never printed
+        output = a.get("--output")
+        if output is not None:
+            if not os.path.exists(output):
+                raise SystemExit("refusing to save key without matching prepared file")
+            existing = json.loads(read_secret_file(output))
+            if (existing.get("order_id") != data["order_id"]
+                    or existing.get("purchase_intent") != data.get("purchase_intent")):
+                raise SystemExit("refusing to save key for conflicting identity/intent")
+            if key is not None:
+                if existing.get("order_key") not in (None, key):
+                    raise SystemExit("refusing to replace different order key")
+                existing.update(data, order_key=key)
+                write_private(output, existing)
+        out["data"] = data
+    print(json.dumps(out))
+    return 0 if body.get("success") else 1
+
+
+def cmd_order_status(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = _req("GET", GW.rstrip("/") + "/orders/" + a["--order-id"],
+                      headers={"Authorization": "Bearer " + bt})
+    if body.get("success"):
+        body["data"].pop("order_key", None)
+    print(json.dumps({"http": code, "data": body.get("data"), "code": body.get("code")}))
+    return 0 if body.get("success") else 1
+
+
+def cmd_order_model_select(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = _req("POST", GW.rstrip("/") + "/orders/" + a["--order-id"] + "/model",
+                      {"registry": "huggingface", "repository": a["--repository"],
+                       "revision": a["--revision"], "file": a["--file"],
+                       "idempotency_key": a["--idempotency-key"]},
+                      {"Content-Type": "application/json",
+                       "Authorization": "Bearer " + bt})
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code"),
+           "detail": body.get("detail")}
+    if body.get("success"):
+        out["data"] = body.get("data")
+    print(json.dumps(out))
+    return 0 if body.get("success") else 1
+
+
+def cmd_order_model_status(a):
+    bt = buyer_login(a["--api"], a["--buyer-creds"])
+    code, body = _req("GET", GW.rstrip("/") + "/orders/" + a["--order-id"] + "/model",
+                      headers={"Authorization": "Bearer " + bt})
+    out = {"http": code, "ok": body.get("success"), "code": body.get("code"),
+           "detail": body.get("detail")}
+    if body.get("success"):
+        out["data"] = body.get("data")
+    print(json.dumps(out))
+    return 0 if body.get("success") else 1
+
+
+def parse(argv):
+    if len(argv) < 1 or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        print("commands: offer-publish offer-list offer-withdraw order-acquire order-status order-model-select order-model-status purchase-prepare purchase-status maintenance-status maintenance-acquire maintenance-release")
+        print("args as --key value pairs; see README for fields")
+        return None
+    name, rest = argv[0], argv[1:]
+    args = {}
+    i = 0
+    while i < len(rest):
+        if rest[i].startswith("--") and i + 1 < len(rest):
+            args[rest[i]] = rest[i + 1]
+            i += 2
+        else:
+            raise SystemExit(f"bad arg {rest[i]!r}")
+    return name, args
+
+
+COMMANDS = {"offer-publish": cmd_offer_publish, "offer-list": cmd_offer_list,
+            "offer-withdraw": cmd_offer_withdraw, "order-acquire": cmd_order_acquire,
+            "order-status": cmd_order_status, "order-model-select": cmd_order_model_select,
+            "order-model-status": cmd_order_model_status,
+            "purchase-prepare": cmd_purchase_prepare,
+            "purchase-status": cmd_purchase_status,
+            "maintenance-status": cmd_maintenance_status,
+            "maintenance-acquire": cmd_maintenance_acquire,
+            "maintenance-release": cmd_maintenance_release}
+
+
+if __name__ == "__main__":
+    parsed = parse(sys.argv[1:])
+    if parsed is None:
+        raise SystemExit(0)
+    name, args = parsed
+    if name not in COMMANDS:
+        raise SystemExit(f"unknown command {name}")
+    try:
+        raise SystemExit(COMMANDS[name](args))
+    except (KeyError, ValueError) as error:
+        raise SystemExit("invalid arguments or response; use --help") from None
